@@ -17,6 +17,8 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/cabo/cabo-backend/internal/roomsvc/authclient"
+	"github.com/cabo/cabo-backend/internal/roomsvc/game"
 	"github.com/cabo/cabo-backend/internal/roomsvc/registry"
 	"github.com/cabo/cabo-backend/internal/roomsvc/ws"
 )
@@ -45,7 +47,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	handler := ws.NewHandler(log, onConnect(log))
+	authClient, err := newAuthClient(log)
+	if err != nil {
+		log.Error("failed to configure authclient", "error", err)
+		os.Exit(1)
+	}
+
+	roomManager := game.NewRoomManager(log, authClient)
+
+	handler := ws.NewHandler(log, onConnect(log, roomManager))
 
 	mux := http.NewServeMux()
 	mux.Handle("/ws", handler)
@@ -130,10 +140,33 @@ func newRegistrar(log *slog.Logger) (*registry.Registrar, error) {
 	return registry.NewRegistrar(registry.NewClientv3Adapter(etcdClient), advertiseAddr, capacity, leaseTTL, log), nil
 }
 
+// newAuthClient builds an authclient.Client from environment
+// configuration. See internal/roomsvc/authclient's package doc for the
+// contract it calls (authsvc's POST /rooms/register) and why
+// ROOMSVC_ADVERTISE_ADDR is read again here rather than threaded in from
+// newRegistrar: each constructor validates its own inputs independently,
+// consistent with the rest of this file.
+func newAuthClient(log *slog.Logger) (authclient.Client, error) {
+	advertiseAddr := os.Getenv("ROOMSVC_ADVERTISE_ADDR")
+	if advertiseAddr == "" {
+		return nil, errors.New("ROOMSVC_ADVERTISE_ADDR is required (address other services use to reach this instance)")
+	}
+
+	authsvcAddr := os.Getenv("AUTHSVC_INTERNAL_ADDR")
+	if authsvcAddr == "" {
+		return nil, errors.New("AUTHSVC_INTERNAL_ADDR is required (base URL of authsvc's internal API, e.g. \"http://10.0.4.5:8080\")")
+	}
+
+	return authclient.NewHTTPClient(authsvcAddr, advertiseAddr, log), nil
+}
+
 // onConnect is the seam where auth validation and room assignment will
 // plug in once the stateless-tier handoff contract is decided (spine
-// "Deferred" items). For now it just reads and logs frames.
-func onConnect(log *slog.Logger) func(*ws.Connection) {
+// "Deferred" items). roomManager is threaded through ready for that —
+// it is not called from here yet, since there is no decided way for a
+// WebSocket connection to say which room (or new room) it belongs to.
+// For now this just reads and logs frames.
+func onConnect(log *slog.Logger, roomManager *game.RoomManager) func(*ws.Connection) {
 	return func(conn *ws.Connection) {
 		conn.ReadLoop(context.Background(), func(data []byte) {
 			log.Info("message received", "remote_addr", conn.RemoteAddr(), "bytes", len(data))

@@ -103,9 +103,13 @@ Two decisions below are placeholders, expected to change:
 
 Implemented so far:
 
-- `cmd/roomsvc/main.go` — roomsvc entrypoint. Starts an HTTP server on
-  `:8081`, mounts `internal/roomsvc/ws.Handler` at `/ws`, graceful shutdown
-  on SIGINT/SIGTERM.
+- `cmd/roomsvc/main.go` — roomsvc entrypoint. Constructs a `registry.Registrar`
+  (`newRegistrar`) and starts it before serving, constructs an
+  `authclient.Client` (`newAuthClient`) and a `game.RoomManager` wrapping
+  it, starts an HTTP server on `:8081`, mounts `internal/roomsvc/ws.Handler`
+  at `/ws` (passing `RoomManager` into `onConnect`, unused there for now —
+  see the `authclient` note below), and shuts down gracefully on
+  SIGINT/SIGTERM, stopping the registrar as part of that.
 - `internal/roomsvc/ws/` — WebSocket transport, no game-domain knowledge.
   `Handler` upgrades an HTTP request and hands the resulting `Connection` to
   an `OnConnect` hook. `Connection` owns read (`ReadLoop`), write (`Write`),
@@ -131,8 +135,9 @@ Implemented so far:
   gap, not an oversight. `NewRoomManager` now also takes an
   `authclient.Client`; `CreateRoom` calls `NotifyRoomCreated` after
   registering the room (never before — a failed `NewGameRoom` call
-  notifies nobody). Not yet constructed in `cmd/roomsvc/main.go` — see the
-  `registry`/`authclient` note below for why.
+  notifies nobody). Constructed in `cmd/roomsvc/main.go` and passed into
+  `onConnect`, but `onConnect` does not call any of its methods yet — see
+  the `authclient` note below for why.
 - `cmd/authsvc/main.go` — implemented, scoped to room-allocation only: no
   login/auth/user-identity work (that's a separate, undecided design
   effort — see AD-6's "login, logout, authentication" wording, not
@@ -176,11 +181,15 @@ Implemented so far:
   interface purely as a test seam (same reasoning as
   `authsvc/roomdirectory.RoomDirectory`) — `RoomManager` is the only
   caller. Wired into `game.RoomManager` (`NewRoomManager` now takes a
-  `Client`), but not yet constructed in `cmd/roomsvc/main.go` — there is
-  nowhere to hand a `RoomManager` to yet, since room assignment onto
-  WebSocket connections is still a deferred spine item. Wiring both
-  `RoomManager` and `authclient.NewHTTPClient` into `main.go` together is
-  the next step once that lands.
+  `Client`), and both are constructed in `cmd/roomsvc/main.go`:
+  `newAuthClient` reads `ROOMSVC_ADVERTISE_ADDR` (same value `newRegistrar`
+  reads — each constructor validates its own env vars independently, no
+  shared config struct) and `AUTHSVC_INTERNAL_ADDR` (base URL of authsvc's
+  internal API), builds the `httpClient`, and hands it to
+  `game.NewRoomManager`. `RoomManager` is threaded into `onConnect` as a
+  parameter but not called from there yet — room assignment onto WebSocket
+  connections is still a deferred spine item, so there is no decided way
+  for a connection to trigger `CreateRoom`/`GetRoom` yet.
 - `internal/authsvc/roomdirectory/` — the Redis half of the flow above.
   `RoomDirectory` is an interface (`RegisterRoom`, `LookupRoom`); callers
   depend only on it, never on Redis directly, so the backing store can be

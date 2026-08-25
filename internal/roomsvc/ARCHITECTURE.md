@@ -202,13 +202,16 @@ only real implementation. `advertiseAddr` is the same value passed to
 `registry.NewRegistrar` — this instance's own externally-reachable
 address, sent alongside every room ID.
 
-`RoomManager` now takes a `Client` in its constructor and calls
+`RoomManager` takes a `Client` in its constructor and calls
 `NotifyRoomCreated` after registering a newly created room (see
-`internal/roomsvc/game`, above) — but neither `RoomManager` nor
-`httpClient` is constructed in `cmd/roomsvc/main.go` yet. Room assignment
-onto WebSocket connections is still a deferred spine item (`onConnect`'s
-own comment), so there is nowhere in `main.go` to hand a `RoomManager` to
-yet; wiring both in together is the next step once that lands.
+`internal/roomsvc/game`, above). Both `RoomManager` and `httpClient` are
+now constructed in `cmd/roomsvc/main.go` (`newAuthClient` reads
+`ROOMSVC_ADVERTISE_ADDR` and `AUTHSVC_INTERNAL_ADDR`, builds the
+`httpClient`, and hands it to `game.NewRoomManager`); `RoomManager` itself
+is threaded into `onConnect` as a constructor parameter, ready for when
+WebSocket-to-room assignment is decided, but `onConnect` does not call any
+of its methods yet — room assignment onto WebSocket connections is still a
+deferred spine item.
 
 ## How it all fits together
 
@@ -218,7 +221,8 @@ classDiagram
         <<cmd/roomsvc/main.go>>
         +main()
         -newRegistrar(log) (*Registrar, error)
-        -onConnect(log) func(*Connection)
+        -newAuthClient(log) (Client, error)
+        -onConnect(log, roomManager) func(*Connection)
     }
 
     class Handler
@@ -234,6 +238,8 @@ classDiagram
     roomsvc_main ..> Handler : constructs, mounts at /ws
     roomsvc_main ..> Connection : onConnect() calls ReadLoop
     roomsvc_main ..> Registrar : constructs, Start() before serving, Stop() on shutdown
+    roomsvc_main ..> httpClient : constructs via newAuthClient
+    roomsvc_main ..> RoomManager : constructs, injects httpClient, passes into onConnect
     Handler --> Connection : creates on upgrade
     RoomManager --> GameRoom : CreateRoom / GetRoom
     RoomManager --> Client : NotifyRoomCreated after CreateRoom
@@ -242,7 +248,7 @@ classDiagram
     GameRoom --> GameState : State
     Player --> Connection : Conn
 
-    note for RoomManager "not yet constructed in main.go —\nsee authclient section above"
+    note for RoomManager "constructed in main.go and passed into\nonConnect, but onConnect does not call\nit yet — WS-to-room assignment is\nstill a deferred spine item"
 ```
 
 A client connects over WebSocket (`Handler` → `Connection`). Once room
@@ -252,9 +258,11 @@ the first player) or `RoomManager.GetRoom` + `GameRoom.JoinRoom` (for
 subsequent players). `CreateRoom` also calls `Client.NotifyRoomCreated` so
 authsvc learns the new room's address; this never blocks or fails room
 creation itself. Independently of any of this, `Registrar` keeps the
-process's own liveness lease renewed in etcd for as long as roomsvc runs —
-`Registrar` is the only one of these pieces actually wired into `main.go`
-today.
+process's own liveness lease renewed in etcd for as long as roomsvc runs.
+All three — `Registrar`, `RoomManager`, and the `authclient.httpClient` it
+wraps — are constructed and running in `main.go` today; only the actual
+call from a WebSocket connection into `RoomManager` is still missing,
+pending the room-assignment decision.
 
 ## Non-class files
 
