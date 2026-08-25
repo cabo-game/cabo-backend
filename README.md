@@ -2,14 +2,6 @@
 
 Backend services for Cabo, a multiplayer card game.
 
-## Architecture
-
-The architecture decisions for this backend are not duplicated here — they live in the shared BMAD project repository, kept in sync as the design evolves:
-
-- **Architecture spine:** [`../cabo-bmad/_bmad-output/planning-artifacts/architecture/architecture-cabo-2026-08-22/ARCHITECTURE-SPINE.md`](../cabo-bmad/_bmad-output/planning-artifacts/architecture/architecture-cabo-2026-08-22/ARCHITECTURE-SPINE.md)
-
-Read it before touching service boundaries, server tiers, room ownership, or discovery/coordination. See [`CLAUDE.md`](CLAUDE.md) for the full rules on working with the shared BMAD context.
-
 ## Services
 
 Two independently deployable binaries in one repo for now (see the spine, `AD-8`, for why and when that changes):

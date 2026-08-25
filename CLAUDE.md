@@ -7,6 +7,14 @@ This repository contains the backend service of the Cabo system.
 Cabo is a multi-service project. The backend is developed independently
 from the other services and has its own Git repository.
 
+## Project Context
+
+Before making changes, read `README.md` to understand the purpose,
+architecture, setup, and development conventions of this service.
+
+Keep the README up to date when changes materially affect the documented
+architecture, setup, or service behavior.
+
 ## Shared BMAD Context
 
 The shared BMAD project repository is located at:
@@ -65,6 +73,158 @@ For significant changes:
 5. Implement the change.
 6. Test the implementation.
 7. Review the result against the requirements and architecture.
+
+## Current State
+
+A Go toolchain (1.27.x) is available and has been used to build and test
+this code. `go build ./...`, `go vet ./...`, and `go test ./... -race` all
+pass as of the `registry` package landing (see below); `go mod tidy`
+produces no changes. Re-verify and update this note if that ever stops
+being true.
+
+This repo is being developed under the Amelia persona from
+`../cabo-bmad/.claude/skills/bmad-agent-dev/`, with team customizations in
+`../cabo-bmad/_bmad/custom/bmad-agent-dev.toml` (TDD discipline, halt-for-
+design-approval before coding, mandatory architecture docs per class, no
+tests for logic-free code). Load that persona for consistent behavior
+across sessions.
+
+Two decisions below are placeholders, expected to change:
+
+- **Module path** is `github.com/cabo/cabo-backend` — a placeholder; the
+  real GitHub org is not yet decided. Changing it later means a repo-wide
+  find-and-replace across every import line (not a config-only change,
+  unlike a bundler path alias) — budget for that when it happens.
+- **WebSocket library** is `github.com/coder/websocket`. This repo
+  originally used `nhooyr.io/websocket`; that module is deprecated in favor
+  of the same code maintained under this new path. If a dependency update
+  ever suggests moving off `coder/websocket`, check whether it's another
+  such rename before assuming a real migration is needed.
+
+Implemented so far:
+
+- `cmd/roomsvc/main.go` — roomsvc entrypoint. Starts an HTTP server on
+  `:8081`, mounts `internal/roomsvc/ws.Handler` at `/ws`, graceful shutdown
+  on SIGINT/SIGTERM.
+- `internal/roomsvc/ws/` — WebSocket transport, no game-domain knowledge.
+  `Handler` upgrades an HTTP request and hands the resulting `Connection` to
+  an `OnConnect` hook. `Connection` owns read (`ReadLoop`), write (`Write`),
+  and `Close` for one client connection.
+- `internal/roomsvc/game/` — game domain, package `game` (imports `ws` for
+  `Player.Conn`; `ws` has no dependency back on `game`). `GameRoom` (id, `*GameState`,
+  `MaxPlayers`, seated `Player`s) cannot be constructed without at least one
+  player, and `NewGameRoom` rejects a `maxPlayers` outside `1..MaxPlayersPerRoom`
+  with an error. `JoinRoom` seats a new player under a mutex, so the
+  capacity check and the append can't race across goroutines. `Player`
+  wraps a `*ws.Connection` with player identity. `GameState` is an explicit
+  placeholder — see Shared Project Context above; its real shape is
+  deferred to the shared game-logic spec, not invented here. `room_code.go`
+  generates the room's id: an 8-character, `crypto/rand`-backed code from an
+  alphabet with ambiguous characters removed. Collision checking against
+  other live rooms is a known, intentional gap — no room registry exists
+  yet to check against. `rules.go` holds game constants mirrored from
+  `../cabo-bmad/docs/cabo.md` (currently `MaxPlayersPerRoom = 4`) — update
+  that doc first, this file second, if a rule ever changes. `RoomManager`
+  tracks every `GameRoom` live on this instance, keyed by room ID
+  (`CreateRoom`, `GetRoom`), guarded by an `RWMutex`. It never removes a
+  room — match/round-ending isn't decided yet, so cleanup is an intentional
+  gap, not an oversight. `NewRoomManager` now also takes an
+  `authclient.Client`; `CreateRoom` calls `NotifyRoomCreated` after
+  registering the room (never before — a failed `NewGameRoom` call
+  notifies nobody). Not yet constructed in `cmd/roomsvc/main.go` — see the
+  `registry`/`authclient` note below for why.
+- `cmd/authsvc/main.go` — implemented, scoped to room-allocation only: no
+  login/auth/user-identity work (that's a separate, undecided design
+  effort — see AD-6's "login, logout, authentication" wording, not
+  implemented at all yet). The room-creation handoff flow is recorded as
+  AD-9 in the shared spine
+  (`../cabo-bmad/_bmad-output/planning-artifacts/architecture/architecture-cabo-2026-08-22/ARCHITECTURE-SPINE.md`).
+  `main.go` connects to Redis and etcd (env vars `REDIS_ADDR`,
+  `ETCD_ENDPOINTS`), constructs a `RedisRoomDirectory` and an
+  `EtcdServerPicker`, hands both to `api.Server`, and serves on `:8080`
+  with graceful shutdown — same shape as `roomsvc/main.go`.
+- `internal/roomsvc/registry/` — etcd liveness registration for this
+  roomsvc instance (AD-7). `Registrar.Start` grants a lease, writes
+  `/roomsvc/servers/<advertiseAddr>` → `{address, capacity}` under it, and
+  renews it in the background for the life of the process; `Stop` revokes
+  the lease explicitly so a graceful shutdown doesn't leave a stale entry
+  for the TTL to expire. If the keepalive stream ever dies, it
+  re-registers under a new lease with jittered exponential backoff rather
+  than staying unregistered. Depends on a small `etcdClient` interface,
+  not `*clientv3.Client` directly — `clientv3`'s `Put` takes an opaque
+  `OpOption` with no way to read a lease ID back out, so tests fake
+  `etcdClient` directly instead of standing up a real etcd server (the
+  official integration-test package is heavy and was fragile to resolve
+  at the pinned etcd version). Wired into `cmd/roomsvc/main.go`:
+  `newRegistrar` reads `ETCD_ENDPOINTS`, `ROOMSVC_ADVERTISE_ADDR`
+  (required), `ROOMSVC_LEASE_TTL` (default 10s), `ROOMSVC_CAPACITY`
+  (default 0), and `main` calls `Start` before serving and `Stop` during
+  graceful shutdown. See the "roomsvc Registration & Heartbeat LLD"
+  (shared with the user as an Artifact) for the accepted design this
+  implements, including the TTL=10s choice.
+- `internal/roomsvc/authclient/` — notifies authsvc when this instance
+  creates a room, via `Client.NotifyRoomCreated(roomID)`. The LLD's
+  original design batched notifications against an assumed
+  `POST /internal/v1/rooms` array endpoint; once `internal/authsvc/api`
+  was actually built with a single-object `POST /rooms/register` (`204`
+  on success), batching was dropped — `httpClient` now sends one request
+  per notification instead, matching the real contract rather than the
+  LLD's original guess. Fire-and-forget: `NotifyRoomCreated` starts a
+  goroutine and returns immediately, retrying with jittered exponential
+  backoff until the request succeeds; it never returns an error; an
+  authsvc outage must not block room creation (AD-6). `Client` is an
+  interface purely as a test seam (same reasoning as
+  `authsvc/roomdirectory.RoomDirectory`) — `RoomManager` is the only
+  caller. Wired into `game.RoomManager` (`NewRoomManager` now takes a
+  `Client`), but not yet constructed in `cmd/roomsvc/main.go` — there is
+  nowhere to hand a `RoomManager` to yet, since room assignment onto
+  WebSocket connections is still a deferred spine item. Wiring both
+  `RoomManager` and `authclient.NewHTTPClient` into `main.go` together is
+  the next step once that lands.
+- `internal/authsvc/roomdirectory/` — the Redis half of the flow above.
+  `RoomDirectory` is an interface (`RegisterRoom`, `LookupRoom`); callers
+  depend only on it, never on Redis directly, so the backing store can be
+  swapped later by writing a new implementation and changing one
+  constructor call. `RedisRoomDirectory` is the current implementation —
+  every entry gets a TTL (a safety net against orphaned entries, since
+  nothing cleans them up yet) and translates a Redis miss into
+  `ErrRoomNotFound` so callers never need to import `go-redis`. Tested
+  against `miniredis` (an in-process fake), not a real Redis instance.
+- `internal/authsvc/redisclient/` — bare Redis connection setup
+  (`New(ctx, addr)`), kept separate from `roomdirectory` so "how to
+  connect" and "what operations we need" stay independent.
+- `internal/authsvc/serverpicker/` — `ServerPicker` interface
+  (`PickServer`); callers never depend on etcd directly. `EtcdServerPicker`
+  reads the same `/roomsvc/servers/` roster roomsvc's `Registrar` writes
+  (AD-7) and returns the first registration found — no placement policy is
+  decided yet. Tested against a fake `etcdReader`, not a real etcd server.
+- `internal/authsvc/api/` — the HTTP controller layer implementing AD-9:
+  `POST /rooms/allocate` (pick a server, AD-9 step 1), `POST
+  /rooms/register` (roomsvc reports a new room, AD-9 steps 3-4), `GET
+  /rooms/{roomID}` (second player looks up a room's server). Depends only
+  on `RoomDirectory` and `ServerPicker`, never on Redis/etcd directly. The
+  register-room request shape (`{room_id, server_address}`, `204` on
+  success) is now the contract `internal/roomsvc/authclient` builds
+  against as-is — no batching, one request per room. If this shape ever
+  needs to change (e.g. to accept a batch), that's a coordinated change on
+  both sides, not a roomsvc-only one.
+
+For how these pieces connect, read `internal/roomsvc/ARCHITECTURE.md` and
+`internal/authsvc/ARCHITECTURE.md` (class diagrams per service) before
+making structural changes — the fastest way to get oriented. Per-class
+purpose and method docs live in
+`../cabo-bmad/_bmad-output/implementation-artifacts/architecture/`.
+
+Nothing here is authoritative over the shared spine
+(`../cabo-bmad/_bmad-output/planning-artifacts/architecture/`) — if this
+section and the spine ever disagree, the spine wins and this section is
+stale and should be corrected.
+
+## Testing
+
+Do not write a unit test for code that has no logic to break (e.g. a plain
+data struct with no methods or behavior). Add tests once the code has
+behavior worth verifying.
 
 ## Backend Responsibility
 
