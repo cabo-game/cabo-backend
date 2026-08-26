@@ -107,37 +107,55 @@ Implemented so far:
   (`newRegistrar`) and starts it before serving, constructs an
   `authclient.Client` (`newAuthClient`) and a `game.RoomManager` wrapping
   it, starts an HTTP server on `:8081`, mounts `internal/roomsvc/ws.Handler`
-  at `/ws` (passing `RoomManager` into `onConnect`, unused there for now —
-  see the `authclient` note below), and shuts down gracefully on
-  SIGINT/SIGTERM, stopping the registrar as part of that.
+  at `/ws` — `onConnect` runs `handoff.Handle` on every new connection (see
+  the `handoff` note below) before falling through to `conn.ReadLoop` — and
+  shuts down gracefully on SIGINT/SIGTERM, stopping the registrar as part
+  of that.
 - `internal/roomsvc/ws/` — WebSocket transport, no game-domain knowledge.
   `Handler` upgrades an HTTP request and hands the resulting `Connection` to
-  an `OnConnect` hook. `Connection` owns read (`ReadLoop`), write (`Write`),
-  and `Close` for one client connection.
+  an `OnConnect` hook. `Connection` owns read (`ReadOne`, `ReadLoop`), write
+  (`Write`), and close (`Close`, `CloseNow`) for one client connection.
+  `ReadOne` reads exactly one message without closing on success — added
+  for `handoff` to inspect the first message before deciding what happens
+  next — and shares frame-reading/error-classification with `ReadLoop` via
+  a private `readFrame` helper. `Close` performs a full close handshake
+  (waits up to 5s for the peer's close frame, per `coder/websocket`'s own
+  docs); `CloseNow` skips that wait entirely. This distinction is not
+  cosmetic: `handoff.reject` originally called `Close` right after writing
+  a rejection, and its tests hung for exactly that 5s wait, since a test
+  client has no reason to send a close frame back after already being told
+  why the connection is ending. Use `CloseNow` whenever the peer has
+  already gotten its answer through some other channel.
 - `internal/roomsvc/game/` — game domain, package `game` (imports `ws` for
   `Player.Conn`; `ws` has no dependency back on `game`). `GameRoom` (id, `*GameState`,
   `MaxPlayers`, seated `Player`s) cannot be constructed without at least one
   player, and `NewGameRoom` rejects a `maxPlayers` outside `1..MaxPlayersPerRoom`
   with an error. `JoinRoom` seats a new player under a mutex, so the
   capacity check and the append can't race across goroutines. `Player`
-  wraps a `*ws.Connection` with player identity. `GameState` is an explicit
-  placeholder — see Shared Project Context above; its real shape is
-  deferred to the shared game-logic spec, not invented here. `room_code.go`
-  generates the room's id: an 8-character, `crypto/rand`-backed code from an
-  alphabet with ambiguous characters removed. Collision checking against
-  other live rooms is a known, intentional gap — no room registry exists
-  yet to check against. `rules.go` holds game constants mirrored from
-  `../cabo-bmad/docs/cabo.md` (currently `MaxPlayersPerRoom = 4`) — update
-  that doc first, this file second, if a rule ever changes. `RoomManager`
-  tracks every `GameRoom` live on this instance, keyed by room ID
-  (`CreateRoom`, `GetRoom`), guarded by an `RWMutex`. It never removes a
-  room — match/round-ending isn't decided yet, so cleanup is an intentional
-  gap, not an oversight. `NewRoomManager` now also takes an
+  wraps a `*ws.Connection` with player identity; `NewPlayer(conn)`
+  generates a random, opaque ID (`generatePlayerID`, 128 bits via
+  `crypto/rand`) — not authentication, just enough to distinguish players
+  within this instance's rooms (real identity is a separate, undecided
+  design effort). Existing tests still build `Player{ID: "..."}` literals
+  directly where a fixed ID is more convenient for assertions; `NewPlayer`
+  is for real connections, via `handoff` (see below). `GameState` is an
+  explicit placeholder — see Shared Project Context above; its real shape
+  is deferred to the shared game-logic spec, not invented here.
+  `room_code.go` generates the room's id: an 8-character, `crypto/rand`-backed
+  code from an alphabet with ambiguous characters removed. Collision
+  checking against other live rooms is a known, intentional gap — no room
+  registry exists yet to check against. `rules.go` holds game constants
+  mirrored from `../cabo-bmad/docs/cabo.md` (currently `MaxPlayersPerRoom
+  = 4`) — update that doc first, this file second, if a rule ever changes.
+  `RoomManager` tracks every `GameRoom` live on this instance, keyed by
+  room ID (`CreateRoom`, `GetRoom`), guarded by an `RWMutex`. It never
+  removes a room — match/round-ending isn't decided yet, so cleanup is an
+  intentional gap, not an oversight. `NewRoomManager` now also takes an
   `authclient.Client`; `CreateRoom` calls `NotifyRoomCreated` after
   registering the room (never before — a failed `NewGameRoom` call
-  notifies nobody). Constructed in `cmd/roomsvc/main.go` and passed into
-  `onConnect`, but `onConnect` does not call any of its methods yet — see
-  the `authclient` note below for why.
+  notifies nobody). Constructed in `cmd/roomsvc/main.go` and now actually
+  called from `onConnect`, via `handoff.Handle` (see below) — no longer
+  just threaded through unused.
 - `cmd/authsvc/main.go` — implemented, scoped to room-allocation only: no
   login/auth/user-identity work (that's a separate, undecided design
   effort — see AD-6's "login, logout, authentication" wording, not
@@ -186,10 +204,30 @@ Implemented so far:
   reads — each constructor validates its own env vars independently, no
   shared config struct) and `AUTHSVC_INTERNAL_ADDR` (base URL of authsvc's
   internal API), builds the `httpClient`, and hands it to
-  `game.NewRoomManager`. `RoomManager` is threaded into `onConnect` as a
-  parameter but not called from there yet — room assignment onto WebSocket
-  connections is still a deferred spine item, so there is no decided way
-  for a connection to trigger `CreateRoom`/`GetRoom` yet.
+  `game.NewRoomManager`, which `onConnect` now calls into via
+  `handoff.Handle` (see below) — room assignment onto WebSocket
+  connections is no longer a deferred item.
+- `internal/roomsvc/handoff/` — the WebSocket create/join handshake every
+  new connection performs before joining the normal game message flow
+  (spine AD-9's roomsvc-side half). The exact message shape was previously
+  in the shared spine's "Deferred" list ("Exact WebSocket message/protocol
+  contract between client and backend"); it's now decided pragmatically
+  (no client existed yet to have assumed something else) and recorded in
+  `internal/roomsvc/ARCHITECTURE.md`: the client sends one JSON message —
+  `{"action":"create_room"}` or `{"action":"join_room","room_id":"..."}` —
+  and `Handle` replies with one JSON message — `{"status":"ok","room_id":"..."}`
+  or `{"status":"error","message":"..."}`. `Handle(ctx, conn, roomManager,
+  log) (*Player, *GameRoom, error)` reads exactly one message via
+  `Connection.ReadOne`, dispatches to `RoomManager.CreateRoom` or
+  `RoomManager.GetRoom`+`GameRoom.JoinRoom`, and writes back the outcome.
+  On failure it closes the connection with `CloseNow` (not `Close` — see
+  the `ws` note above for why: the client already has its answer in the
+  JSON body, so there's nothing to wait for). Depends on both `ws` and
+  `game`; neither depends back on it. Tested against a real WebSocket
+  server via `httptest`, same pattern as `ws`'s own tests. Wired into
+  `cmd/roomsvc/main.go`'s `onConnect`: on success, `onConnect` logs the
+  player/room and continues with `conn.ReadLoop`; on failure, it logs and
+  returns (the connection is already closed).
 - `internal/authsvc/roomdirectory/` — the Redis half of the flow above.
   `RoomDirectory` is an interface (`RegisterRoom`, `LookupRoom`); callers
   depend only on it, never on Redis directly, so the backing store can be

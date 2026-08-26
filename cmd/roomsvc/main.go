@@ -19,6 +19,7 @@ import (
 
 	"github.com/cabo/cabo-backend/internal/roomsvc/authclient"
 	"github.com/cabo/cabo-backend/internal/roomsvc/game"
+	"github.com/cabo/cabo-backend/internal/roomsvc/handoff"
 	"github.com/cabo/cabo-backend/internal/roomsvc/registry"
 	"github.com/cabo/cabo-backend/internal/roomsvc/ws"
 )
@@ -160,16 +161,27 @@ func newAuthClient(log *slog.Logger) (authclient.Client, error) {
 	return authclient.NewHTTPClient(authsvcAddr, advertiseAddr, log), nil
 }
 
-// onConnect is the seam where auth validation and room assignment will
-// plug in once the stateless-tier handoff contract is decided (spine
-// "Deferred" items). roomManager is threaded through ready for that —
-// it is not called from here yet, since there is no decided way for a
-// WebSocket connection to say which room (or new room) it belongs to.
-// For now this just reads and logs frames.
+// onConnect runs the create/join handshake (spine AD-9; see
+// internal/roomsvc/handoff and internal/roomsvc/ARCHITECTURE.md for the
+// message contract) on every new connection, then hands off to the
+// normal read loop for whatever comes next. Real auth validation is still
+// a separate, undecided design effort (see CLAUDE.md's Current State) —
+// this only decides which room a connection belongs to, not who the
+// player is.
 func onConnect(log *slog.Logger, roomManager *game.RoomManager) func(*ws.Connection) {
 	return func(conn *ws.Connection) {
-		conn.ReadLoop(context.Background(), func(data []byte) {
-			log.Info("message received", "remote_addr", conn.RemoteAddr(), "bytes", len(data))
+		ctx := context.Background()
+
+		player, room, err := handoff.Handle(ctx, conn, roomManager, log)
+		if err != nil {
+			log.Info("handoff failed", "remote_addr", conn.RemoteAddr(), "error", err)
+			return
+		}
+
+		log.Info("player joined room", "remote_addr", conn.RemoteAddr(), "player_id", player.ID, "room_id", room.ID)
+
+		conn.ReadLoop(ctx, func(data []byte) {
+			log.Info("message received", "player_id", player.ID, "room_id", room.ID, "bytes", len(data))
 		})
 	}
 }

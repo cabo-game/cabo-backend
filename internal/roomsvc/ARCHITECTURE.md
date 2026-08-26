@@ -4,9 +4,12 @@ One consolidated view of every struct in roomsvc so far and how they link
 together. Individual per-class docs (purpose + method descriptions) live in
 `cabo-bmad/_bmad-output/implementation-artifacts/architecture/`.
 
-roomsvc is split into two packages: `ws` (WebSocket transport) and `game`
-(game domain). `game` imports `ws` for `Player.Conn`; `ws` has no
-dependency back on `game`.
+roomsvc is split into five packages: `ws` (WebSocket transport), `game`
+(game domain), `registry` (etcd liveness), `authclient` (authsvc
+notification), and `handoff` (the WebSocket create/join handshake, layered
+above both `ws` and `game`). Dependencies only point one way — `game`
+imports `ws` for `Player.Conn`; `handoff` imports both `ws` and `game`;
+none of `ws`, `game`, `registry`, or `authclient` import `handoff`.
 
 ## internal/roomsvc/ws — WebSocket transport
 
@@ -30,13 +33,34 @@ classDiagram
         -writeMu sync.Mutex
         +NewConnection(conn, remoteAddr, log) *Connection
         +RemoteAddr() string
+        +ReadOne(ctx) ([]byte, error)
         +ReadLoop(ctx, onMessage)
         +Write(ctx, data) error
         +Close(code, reason)
+        +CloseNow()
     }
 
     Handler --> Connection : creates on upgrade, passes to OnConnect
 ```
+
+`ReadOne` reads exactly one message and returns it, without closing the
+connection on success — added for `handoff` (below) to inspect the first
+message before deciding what happens next. It shares frame-reading and
+error-classification with `ReadLoop` via a private `readFrame` helper, so
+both apply the same context-cancellation handling (see `ReadLoop`'s doc
+comment: `coder/websocket`'s `Read` doesn't reliably unblock on `ctx`
+cancellation, so both watch `ctx` and force-close instead).
+
+`Close` performs a full WebSocket close handshake and waits up to 5s for
+the peer to send back its own close frame — appropriate when ending a
+connection the peer might still want to gracefully wind down (e.g. server
+shutdown). `CloseNow` skips that handshake entirely; use it when the peer
+already has no reason to cooperate — e.g. it was just told why the
+connection is ending through an application-level message, so there's
+nothing to wait for. This distinction mattered in practice: `handoff`
+(below) originally called `Close` right after writing a rejection, and its
+tests hung for exactly the wait `Close` documents, because the test client
+never sent a close frame back.
 
 ## internal/roomsvc/game — game domain
 
@@ -62,6 +86,7 @@ classDiagram
     class Player {
         +ID string
         +Conn *ws.Connection
+        +NewPlayer(conn) *Player
     }
 
     class GameState {
@@ -72,6 +97,14 @@ classDiagram
     GameRoom "1" --> "1..*" Player : Players
     Player --> Connection : Conn
 ```
+
+`NewPlayer` generates a random, opaque ID for the player (`generatePlayerID`,
+128 bits via `crypto/rand`) — not authentication, just enough to
+distinguish players within this instance's rooms. Real player identity is
+a separate, undecided design effort. Existing tests still construct
+`Player{ID: "..."}` literals directly where a fixed, predictable ID is
+more convenient for assertions; `NewPlayer` is for real connections, via
+`handoff` (below).
 
 `RoomManager` holds every `GameRoom` currently live on this instance, keyed
 by room ID — it is how a room created for player 1 gets found again when
@@ -213,6 +246,83 @@ WebSocket-to-room assignment is decided, but `onConnect` does not call any
 of its methods yet — room assignment onto WebSocket connections is still a
 deferred spine item.
 
+## internal/roomsvc/handoff — WebSocket create/join handshake
+
+Every new WebSocket connection performs a one-message handshake before it
+joins the normal game message flow: the client says whether it wants to
+create a new room or join an existing one, and roomsvc replies once with
+the outcome. This implements roomsvc's half of spine AD-9's client-driven
+handoff. The exact wire format was previously listed in the shared spine's
+"Deferred" list ("Exact WebSocket message/protocol contract between
+client and backend") — it was decided pragmatically here, since no client
+existed yet to have assumed something else, and is recorded below as the
+agreed contract.
+
+### Message contract
+
+The client sends exactly one JSON message immediately after the
+connection opens:
+
+```jsonc
+// Create a new room:
+{"action": "create_room"}
+
+// Join an existing room:
+{"action": "join_room", "room_id": "K7XQPT9M"}
+```
+
+roomsvc replies with exactly one JSON message:
+
+```jsonc
+// Success:
+{"status": "ok", "room_id": "K7XQPT9M"}
+
+// Failure (unknown action, invalid JSON, unknown room, full room, etc.):
+{"status": "error", "message": "roomsvc: room K7XQPT9M is full (max 4 players)"}
+```
+
+An explicit `"action"` field was chosen over inferring intent from
+`room_id` being present/absent/empty — the latter is ambiguous in JSON
+(missing field? empty string? `null`?) and less self-documenting in logs.
+
+On success, the connection stays open and continues into the normal
+`ReadLoop`. On failure, roomsvc has already closed the connection (via
+`CloseNow` — see the `ws` section above for why not `Close`); there is
+nothing further to send or read.
+
+```mermaid
+classDiagram
+    class request {
+        +Action string
+        +RoomID string
+    }
+
+    class response {
+        +Status string
+        +RoomID string
+        +Message string
+    }
+
+    class handoff_pkg {
+        <<internal/roomsvc/handoff/handoff.go>>
+        +Handle(ctx, conn, roomManager, log) (*Player, *GameRoom, error)
+        -reject(ctx, conn, log, message) error
+    }
+
+    handoff_pkg ..> request : unmarshals the first message into
+    handoff_pkg ..> response : marshals success/error replies from
+    handoff_pkg ..> RoomManager : CreateRoom / GetRoom
+    handoff_pkg ..> Player : NewPlayer(conn)
+```
+
+`Handle` reads exactly one message via `Connection.ReadOne`, decides
+`create_room` vs `join_room`, calls `RoomManager` accordingly, and writes
+back the outcome. On success it returns the `*Player` and `*GameRoom` so
+the caller (`cmd/roomsvc/main.go`'s `onConnect`) can log context and
+continue with `conn.ReadLoop`. It depends on both `ws` and `game` (a new
+layer above them, not touched by either) and has no dependency back from
+either into it.
+
 ## How it all fits together
 
 ```mermaid
@@ -227,6 +337,7 @@ classDiagram
 
     class Handler
     class Connection
+    class handoff_pkg["handoff.Handle"]
     class RoomManager
     class GameRoom
     class Player
@@ -236,33 +347,37 @@ classDiagram
     class httpClient
 
     roomsvc_main ..> Handler : constructs, mounts at /ws
-    roomsvc_main ..> Connection : onConnect() calls ReadLoop
     roomsvc_main ..> Registrar : constructs, Start() before serving, Stop() on shutdown
     roomsvc_main ..> httpClient : constructs via newAuthClient
     roomsvc_main ..> RoomManager : constructs, injects httpClient, passes into onConnect
+    roomsvc_main ..> handoff_pkg : onConnect() calls Handle, then Connection.ReadLoop
     Handler --> Connection : creates on upgrade
+    handoff_pkg --> Connection : ReadOne / Write / CloseNow
+    handoff_pkg --> RoomManager : CreateRoom / GetRoom
+    handoff_pkg --> Player : NewPlayer(conn)
     RoomManager --> GameRoom : CreateRoom / GetRoom
     RoomManager --> Client : NotifyRoomCreated after CreateRoom
     Client <|.. httpClient : implements
     GameRoom --> Player : Players
     GameRoom --> GameState : State
     Player --> Connection : Conn
-
-    note for RoomManager "constructed in main.go and passed into\nonConnect, but onConnect does not call\nit yet — WS-to-room assignment is\nstill a deferred spine item"
 ```
 
-A client connects over WebSocket (`Handler` → `Connection`). Once room
-assignment exists (deferred — see spine AD-6/AD-7), that connection's owner
-becomes a `Player`, seated in a `GameRoom` via `RoomManager.CreateRoom` (for
-the first player) or `RoomManager.GetRoom` + `GameRoom.JoinRoom` (for
-subsequent players). `CreateRoom` also calls `Client.NotifyRoomCreated` so
-authsvc learns the new room's address; this never blocks or fails room
-creation itself. Independently of any of this, `Registrar` keeps the
-process's own liveness lease renewed in etcd for as long as roomsvc runs.
-All three — `Registrar`, `RoomManager`, and the `authclient.httpClient` it
-wraps — are constructed and running in `main.go` today; only the actual
-call from a WebSocket connection into `RoomManager` is still missing,
-pending the room-assignment decision.
+A client connects over WebSocket (`Handler` → `Connection`). `onConnect`
+immediately calls `handoff.Handle`, which reads the client's create/join
+message and calls `RoomManager.CreateRoom` (seating a new `Player` as the
+first occupant of a new `GameRoom`) or `RoomManager.GetRoom` +
+`GameRoom.JoinRoom` (seating a new `Player` into an existing one) —
+spine AD-6/AD-7's deferred "room assignment" question is now answered by
+`handoff`'s message contract (see above). `CreateRoom` also calls
+`Client.NotifyRoomCreated` so authsvc learns the new room's address; this
+never blocks or fails room creation itself. On success, `onConnect`
+continues into `conn.ReadLoop` for whatever comes next (actual gameplay
+message routing — not built yet, a separate task). Independently of all
+of this, `Registrar` keeps the process's own liveness lease renewed in
+etcd for as long as roomsvc runs. `Registrar`, `RoomManager`, the
+`authclient.httpClient` it wraps, and now the handoff handshake are all
+constructed and running end-to-end in `main.go`.
 
 ## Non-class files
 

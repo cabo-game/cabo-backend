@@ -1,0 +1,57 @@
+# Local development infrastructure for the Cabo backend.
+#
+# This only runs the infra dependencies (Redis, etcd) — NOT roomsvc/authsvc
+# themselves. Run those directly on your host with `go run` (or `make
+# run-roomsvc` / `make run-authsvc`) so you get fast iteration without
+# rebuilding images on every code change.
+#
+# Ports below match .env.example (REDIS_ADDR=localhost:6379,
+# ETCD_ENDPOINTS=localhost:2379) — start this first, then run the Go
+# binaries against it.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose down          # stop, keep data
+#   docker compose down -v       # stop, wipe data volumes
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  etcd:
+    # Version matches the go.etcd.io/etcd/client/v3 version pinned in
+    # go.mod — keep these in sync when that dependency is bumped.
+    image: gcr.io/etcd-development/etcd:v3.7.1
+    ports:
+      - "2379:2379"
+    volumes:
+      - etcd-data:/etcd-data
+    command:
+      - /usr/local/bin/etcd
+      - --name=cabo-etcd-local
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://0.0.0.0:2380
+      - --initial-cluster=cabo-etcd-local=http://0.0.0.0:2380
+      - --initial-cluster-token=cabo-local
+      - --initial-cluster-state=new
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  redis-data:
+  etcd-data:
