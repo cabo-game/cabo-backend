@@ -30,6 +30,8 @@ const (
 	defaultLeaseTTL        = 10 * time.Second
 	etcdDialTimeout        = 5 * time.Second
 	registrationStartupTTL = 10 * time.Second
+	defaultPingInterval    = 30 * time.Second
+	defaultPingTimeout     = 10 * time.Second
 )
 
 func main() {
@@ -56,7 +58,13 @@ func main() {
 
 	roomManager := game.NewRoomManager(log, authClient)
 
-	handler := ws.NewHandler(log, onConnect(log, roomManager))
+	pingConfig, err := newPingConfig()
+	if err != nil {
+		log.Error("failed to configure ping keepalive", "error", err)
+		os.Exit(1)
+	}
+
+	handler := ws.NewHandler(log, pingConfig, onConnect(log, roomManager))
 
 	mux := http.NewServeMux()
 	mux.Handle("/ws", handler)
@@ -161,6 +169,38 @@ func newAuthClient(log *slog.Logger) (authclient.Client, error) {
 	return authclient.NewHTTPClient(authsvcAddr, advertiseAddr, log), nil
 }
 
+// newPingConfig builds a ws.PingConfig from environment configuration (or
+// the defaults above if unset). This is the ping/pong keepalive every
+// accepted connection's ReadLoop runs to detect a peer that has gone
+// silent without a normal WebSocket close — e.g. a network partition,
+// which a plain read error can't detect since the underlying TCP
+// connection just blocks forever instead of erroring.
+func newPingConfig() (ws.PingConfig, error) {
+	interval := defaultPingInterval
+	if v := os.Getenv("ROOMSVC_PING_INTERVAL"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return ws.PingConfig{}, errors.New("ROOMSVC_PING_INTERVAL must be a valid duration, e.g. \"30s\"")
+		}
+		interval = parsed
+	}
+
+	timeout := defaultPingTimeout
+	if v := os.Getenv("ROOMSVC_PING_TIMEOUT"); v != "" {
+		parsed, err := time.ParseDuration(v)
+		if err != nil {
+			return ws.PingConfig{}, errors.New("ROOMSVC_PING_TIMEOUT must be a valid duration, e.g. \"10s\"")
+		}
+		timeout = parsed
+	}
+
+	if timeout >= interval {
+		return ws.PingConfig{}, errors.New("ROOMSVC_PING_TIMEOUT must be less than ROOMSVC_PING_INTERVAL")
+	}
+
+	return ws.PingConfig{Interval: interval, Timeout: timeout}, nil
+}
+
 // onConnect runs the create/join handshake (spine AD-9; see
 // internal/roomsvc/handoff and internal/roomsvc/ARCHITECTURE.md for the
 // message contract) on every new connection, then hands off to the
@@ -182,6 +222,9 @@ func onConnect(log *slog.Logger, roomManager *game.RoomManager) func(*ws.Connect
 
 		conn.ReadLoop(ctx, func(data []byte) {
 			log.Info("message received", "player_id", player.ID, "room_id", room.ID, "bytes", len(data))
+		}, func() {
+			log.Info("connection closed, removing player from room", "player_id", player.ID, "room_id", room.ID)
+			roomManager.RemovePlayer(room, player.ID)
 		})
 	}
 }

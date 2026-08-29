@@ -76,6 +76,13 @@ For significant changes:
 
 ## Current State
 
+**Ownership split (check before editing):** as of this writing, `internal/roomsvc/`
+and `cmd/roomsvc/` are being developed by a separate tool/session from
+`internal/authsvc/` and `cmd/authsvc/`. If you're working in one service,
+confirm with the user before editing files under the other — do not assume
+this split still holds if it looks stale (e.g. no activity on one side for
+a long time), but don't assume it's gone either. Ask.
+
 A Go toolchain (1.27.x) is available and has been used to build and test
 this code. `go build ./...`, `go vet ./...`, and `go test ./... -race` all
 pass as of the `registry` package landing (see below); `go mod tidy`
@@ -106,9 +113,13 @@ Implemented so far:
 - `cmd/roomsvc/main.go` — roomsvc entrypoint. Constructs a `registry.Registrar`
   (`newRegistrar`) and starts it before serving, constructs an
   `authclient.Client` (`newAuthClient`) and a `game.RoomManager` wrapping
-  it, starts an HTTP server on `:8081`, mounts `internal/roomsvc/ws.Handler`
-  at `/ws` — `onConnect` runs `handoff.Handle` on every new connection (see
-  the `handoff` note below) before falling through to `conn.ReadLoop` — and
+  it, constructs a `ws.PingConfig` (`newPingConfig`, reading
+  `ROOMSVC_PING_INTERVAL`/`ROOMSVC_PING_TIMEOUT`, default 30s/10s — see the
+  `ws` note below), starts an HTTP server on `:8081`, mounts
+  `internal/roomsvc/ws.Handler` at `/ws` — `onConnect` runs `handoff.Handle`
+  on every new connection (see the `handoff` note below) before falling
+  through to `conn.ReadLoop`, passing an `onClose` callback that calls
+  `roomManager.RemovePlayer` so a dropped connection frees its seat — and
   shuts down gracefully on SIGINT/SIGTERM, stopping the registrar as part
   of that.
 - `internal/roomsvc/ws/` — WebSocket transport, no game-domain knowledge.
@@ -118,7 +129,24 @@ Implemented so far:
   `ReadOne` reads exactly one message without closing on success — added
   for `handoff` to inspect the first message before deciding what happens
   next — and shares frame-reading/error-classification with `ReadLoop` via
-  a private `readFrame` helper. `Close` performs a full close handshake
+  a private `readFrame` helper. `ReadLoop` now also takes an `onClose
+  func()` parameter, called exactly once after the loop ends for any
+  reason (client close, read error, context cancellation, or a ping
+  timeout — see next) — the seam for a caller to release whatever it
+  associated with the connection while the loop was running (e.g. seating
+  a player in a room), without `ws` needing any knowledge of what that
+  association is; `ws` still has no dependency on `game`. `ReadLoop` also
+  runs a ping/pong keepalive (`pingLoop`, unexported) for the life of the
+  loop, configured by a `PingConfig{Interval, Timeout}` passed to
+  `NewConnection`/`NewHandler`: it sends a ping every `Interval` and, if no
+  pong is observed within `Timeout`, calls `CloseNow` — this is what
+  detects a peer that has gone silent without a normal WebSocket close
+  (e.g. a network partition), which a plain read error can't catch, since
+  a dead-but-silent TCP connection blocks `Read` forever instead of
+  erroring. `coder/websocket`'s `Ping` only completes once the peer's pong
+  is observed by an in-progress `Read` on the same connection, so
+  `pingLoop` runs as a sibling goroutine to the read loop, started and
+  cancelled together with it — never before or after. `Close` performs a full close handshake
   (waits up to 5s for the peer's close frame, per `coder/websocket`'s own
   docs); `CloseNow` skips that wait entirely. This distinction is not
   cosmetic: `handoff.reject` originally called `Close` right after writing
@@ -148,14 +176,24 @@ Implemented so far:
   mirrored from `../cabo-bmad/docs/cabo.md` (currently `MaxPlayersPerRoom
   = 4`) — update that doc first, this file second, if a rule ever changes.
   `RoomManager` tracks every `GameRoom` live on this instance, keyed by
-  room ID (`CreateRoom`, `GetRoom`), guarded by an `RWMutex`. It never
-  removes a room — match/round-ending isn't decided yet, so cleanup is an
-  intentional gap, not an oversight. `NewRoomManager` now also takes an
-  `authclient.Client`; `CreateRoom` calls `NotifyRoomCreated` after
-  registering the room (never before — a failed `NewGameRoom` call
-  notifies nobody). Constructed in `cmd/roomsvc/main.go` and now actually
-  called from `onConnect`, via `handoff.Handle` (see below) — no longer
-  just threaded through unused.
+  room ID (`CreateRoom`, `GetRoom`), guarded by an `RWMutex`. `GameRoom`
+  now has `RemovePlayer(playerID)`, which removes a seated player and
+  reports whether the room is now empty; `RoomManager.RemovePlayer(room,
+  playerID)` calls it and, if the room is now empty, calls the new
+  `RemoveRoom(roomID)` to drop the room from this instance's registry too.
+  This closes the disconnect case of the room-removal gap: a connection
+  that closes (client close, network error, or `ws.Connection.ReadLoop`'s
+  `onClose` hook firing for any other reason) no longer leaves a
+  permanently occupied, unreachable seat. Full match/round-ending-driven
+  removal (a game ending with players still connected) is still
+  undecided — `RemoveRoom` is a separate method from `RemovePlayer`
+  precisely so that future trigger can call it directly. `NewRoomManager`
+  also takes an `authclient.Client`; `CreateRoom` calls `NotifyRoomCreated`
+  after registering the room (never before — a failed `NewGameRoom` call
+  notifies nobody). Constructed in `cmd/roomsvc/main.go` and called from
+  `onConnect`, via `handoff.Handle` (see below) for the create/join
+  handshake and via `ws.Connection.ReadLoop`'s new `onClose` callback
+  parameter for cleanup when the connection ends.
 - `cmd/authsvc/main.go` — implemented, scoped to room-allocation only: no
   login/auth/user-identity work (that's a separate, undecided design
   effort — see AD-6's "login, logout, authentication" wording, not
@@ -266,6 +304,39 @@ Nothing here is authoritative over the shared spine
 (`../cabo-bmad/_bmad-output/planning-artifacts/architecture/`) — if this
 section and the spine ever disagree, the spine wins and this section is
 stale and should be corrected.
+
+## Running Locally
+
+Neither service bundles its dependencies — etcd and Redis are separate
+processes you must already have running before either `main.go` will
+start (both dial/ping at startup and exit on failure). Both `authsvc` and
+`roomsvc` must point at the **same** etcd cluster: `roomsvc` writes its
+liveness there (AD-7), `authsvc` only reads it.
+
+Minimal local setup (illustrative, not verified end-to-end as an
+installation guide):
+
+```bash
+docker run -d -p 2379:2379 --name etcd quay.io/coreos/etcd:v3.7.1 \
+  etcd --advertise-client-urls http://0.0.0.0:2379 \
+       --listen-client-urls http://0.0.0.0:2379
+docker run -d -p 6379:6379 --name redis redis:8
+```
+
+Required env vars:
+
+- `authsvc`: `REDIS_ADDR`, `ETCD_ENDPOINTS` (comma-separated).
+- `roomsvc`: `ETCD_ENDPOINTS`, `ROOMSVC_ADVERTISE_ADDR` (the address other
+  services should use to reach this instance — not necessarily its bind
+  address; matters behind Docker/NAT/a load balancer), `AUTHSVC_INTERNAL_ADDR`
+  (authsvc's base URL, e.g. `http://10.0.4.5:8080`). Optional:
+  `ROOMSVC_LEASE_TTL` (default 10s), `ROOMSVC_CAPACITY` (default 0),
+  `ROOMSVC_PING_INTERVAL` (default 30s), `ROOMSVC_PING_TIMEOUT` (default
+  10s, must be less than `ROOMSVC_PING_INTERVAL`).
+
+If running both services as separate containers, `ROOMSVC_ADVERTISE_ADDR`
+must be reachable from `authsvc`'s container — `localhost` will not
+resolve to anything useful across containers.
 
 ## Testing
 

@@ -125,3 +125,61 @@ func TestRoomManager_CreateRoom_ConcurrentCreatesAreAllRetrievable(t *testing.T)
 		}
 	}
 }
+
+func TestRoomManager_RemovePlayer_RemovesPlayerButKeepsNonEmptyRoom(t *testing.T) {
+	manager := NewRoomManager(testLogger(), &fakeNotifier{})
+
+	room, err := manager.CreateRoom(&Player{ID: "player-1"}, MaxPlayersPerRoom)
+	if err != nil {
+		t.Fatalf("CreateRoom returned error: %v", err)
+	}
+	second := &Player{ID: "player-2"}
+	if err := room.JoinRoom(second); err != nil {
+		t.Fatalf("JoinRoom returned error: %v", err)
+	}
+
+	manager.RemovePlayer(room, "player-1")
+
+	if len(room.Players) != 1 || room.Players[0] != second {
+		t.Fatalf("room.Players = %v, want only player-2", room.Players)
+	}
+	if _, err := manager.GetRoom(room.ID); err != nil {
+		t.Errorf("GetRoom returned error after removing one of two players: %v", err)
+	}
+}
+
+func TestRoomManager_RemovePlayer_RemovesRoomWhenLastPlayerLeaves(t *testing.T) {
+	manager := NewRoomManager(testLogger(), &fakeNotifier{})
+
+	room, err := manager.CreateRoom(&Player{ID: "player-1"}, MaxPlayersPerRoom)
+	if err != nil {
+		t.Fatalf("CreateRoom returned error: %v", err)
+	}
+
+	manager.RemovePlayer(room, "player-1")
+
+	if _, err := manager.GetRoom(room.ID); err == nil {
+		t.Error("GetRoom returned no error after last player left, want room to be removed")
+	}
+}
+
+func TestRoomManager_RemoveRoom_RemovesRegisteredRoom(t *testing.T) {
+	manager := NewRoomManager(testLogger(), &fakeNotifier{})
+
+	room, err := manager.CreateRoom(&Player{ID: "player-1"}, MaxPlayersPerRoom)
+	if err != nil {
+		t.Fatalf("CreateRoom returned error: %v", err)
+	}
+
+	manager.RemoveRoom(room.ID)
+
+	if _, err := manager.GetRoom(room.ID); err == nil {
+		t.Error("GetRoom returned no error after RemoveRoom, want an error")
+	}
+}
+
+func TestRoomManager_RemoveRoom_UnknownIDDoesNotPanic(t *testing.T) {
+	manager := NewRoomManager(testLogger(), &fakeNotifier{})
+
+	manager.RemoveRoom("does-not-exist")
+}

@@ -13,10 +13,10 @@ import (
 
 func TestConnection_ReadLoop_DeliversMessagesToCallback(t *testing.T) {
 	received := make(chan []byte, 1)
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		c.ReadLoop(context.Background(), func(data []byte) {
 			received <- data
-		})
+		}, func() {})
 	})
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -47,9 +47,9 @@ func TestConnection_ReadLoop_DeliversMessagesToCallback(t *testing.T) {
 
 func TestConnection_Write_DeliversMessageToClient(t *testing.T) {
 	serverConnReady := make(chan *ws.Connection, 1)
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		serverConnReady <- c
-		c.ReadLoop(context.Background(), func(data []byte) {})
+		c.ReadLoop(context.Background(), func(data []byte) {}, func() {})
 	})
 	server := httptest.NewServer(handler)
 	defer server.Close()
@@ -89,8 +89,8 @@ func TestConnection_Write_DeliversMessageToClient(t *testing.T) {
 
 func TestConnection_ReadLoop_ReturnsOnClientClose(t *testing.T) {
 	loopReturned := make(chan struct{})
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
-		c.ReadLoop(context.Background(), func(data []byte) {})
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
+		c.ReadLoop(context.Background(), func(data []byte) {}, func() {})
 		close(loopReturned)
 	})
 	server := httptest.NewServer(handler)
@@ -117,7 +117,7 @@ func TestConnection_ReadLoop_ReturnsOnClientClose(t *testing.T) {
 
 func TestConnection_ReadOne_ReturnsFirstMessage(t *testing.T) {
 	serverConnReady := make(chan *ws.Connection, 1)
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		serverConnReady <- c
 	})
 	server := httptest.NewServer(handler)
@@ -155,7 +155,7 @@ func TestConnection_ReadOne_ReturnsFirstMessage(t *testing.T) {
 
 func TestConnection_ReadOne_DoesNotConsumeMessagesBeyondTheFirst(t *testing.T) {
 	serverConnReady := make(chan *ws.Connection, 1)
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		serverConnReady <- c
 	})
 	server := httptest.NewServer(handler)
@@ -195,7 +195,7 @@ func TestConnection_ReadOne_DoesNotConsumeMessagesBeyondTheFirst(t *testing.T) {
 	received := make(chan []byte, 1)
 	go serverConn.ReadLoop(ctx, func(data []byte) {
 		received <- data
-	})
+	}, func() {})
 
 	select {
 	case second := <-received:
@@ -209,7 +209,7 @@ func TestConnection_ReadOne_DoesNotConsumeMessagesBeyondTheFirst(t *testing.T) {
 
 func TestConnection_ReadOne_ReturnsErrorOnClientClose(t *testing.T) {
 	resultReady := make(chan error, 1)
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		_, err := c.ReadOne(context.Background())
 		resultReady <- err
 	})
@@ -240,7 +240,7 @@ func TestConnection_ReadOne_ReturnsErrorOnClientClose(t *testing.T) {
 
 func TestConnection_ReadOne_ReturnsErrorOnContextCancel(t *testing.T) {
 	resultReady := make(chan error, 1)
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		_, err := c.ReadOne(ctx)
@@ -270,7 +270,7 @@ func TestConnection_ReadOne_ReturnsErrorOnContextCancel(t *testing.T) {
 
 func TestConnection_CloseNow_ReturnsWithoutWaitingForPeerAck(t *testing.T) {
 	closeReturned := make(chan struct{})
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		c.CloseNow()
 		close(closeReturned)
 	})
@@ -300,10 +300,10 @@ func TestConnection_CloseNow_ReturnsWithoutWaitingForPeerAck(t *testing.T) {
 
 func TestConnection_ReadLoop_ReturnsOnContextCancel(t *testing.T) {
 	loopReturned := make(chan struct{})
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		c.ReadLoop(ctx, func(data []byte) {})
+		c.ReadLoop(ctx, func(data []byte) {}, func() {})
 		close(loopReturned)
 	})
 	server := httptest.NewServer(handler)
@@ -322,5 +322,143 @@ func TestConnection_ReadLoop_ReturnsOnContextCancel(t *testing.T) {
 	case <-loopReturned:
 	case <-dialCtx.Done():
 		t.Fatal("timed out waiting for ReadLoop to return after context cancel")
+	}
+}
+
+func TestConnection_ReadLoop_CallsOnCloseAfterClientClose(t *testing.T) {
+	onCloseCalled := make(chan struct{})
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
+		c.ReadLoop(context.Background(), func(data []byte) {}, func() {
+			close(onCloseCalled)
+		})
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	clientConn, _, err := websocket.Dial(ctx, wsURL(server.URL), nil)
+	if err != nil {
+		t.Fatalf("client dial failed: %v", err)
+	}
+
+	if err := clientConn.Close(websocket.StatusNormalClosure, "done"); err != nil {
+		t.Fatalf("client close failed: %v", err)
+	}
+
+	select {
+	case <-onCloseCalled:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for onClose to be called after client close")
+	}
+}
+
+func TestConnection_ReadLoop_CallsOnCloseAfterContextCancel(t *testing.T) {
+	onCloseCalled := make(chan struct{})
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		c.ReadLoop(ctx, func(data []byte) {}, func() {
+			close(onCloseCalled)
+		})
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer dialCancel()
+
+	clientConn, _, err := websocket.Dial(dialCtx, wsURL(server.URL), nil)
+	if err != nil {
+		t.Fatalf("client dial failed: %v", err)
+	}
+	defer clientConn.Close(websocket.StatusNormalClosure, "")
+
+	select {
+	case <-onCloseCalled:
+	case <-dialCtx.Done():
+		t.Fatal("timed out waiting for onClose to be called after context cancel")
+	}
+}
+
+func TestConnection_ReadLoop_SurvivesPingsWhilePeerIsResponsive(t *testing.T) {
+	loopReturned := make(chan struct{})
+	pingConfig := ws.PingConfig{Interval: 50 * time.Millisecond, Timeout: 200 * time.Millisecond}
+	handler := ws.NewHandler(testLogger(), pingConfig, func(c *ws.Connection) {
+		c.ReadLoop(context.Background(), func(data []byte) {}, func() {})
+		close(loopReturned)
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	clientConn, _, err := websocket.Dial(ctx, wsURL(server.URL), nil)
+	if err != nil {
+		t.Fatalf("client dial failed: %v", err)
+	}
+	defer clientConn.Close(websocket.StatusNormalClosure, "")
+
+	// A responsive client must keep reading so its WebSocket library can
+	// observe and auto-reply to pings; a client that never reads would
+	// never see the ping frame at all (see the unresponsive-peer test).
+	go func() {
+		for {
+			if _, _, err := clientConn.Read(ctx); err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-loopReturned:
+		t.Fatal("ReadLoop returned even though the peer was responding to pings")
+	case <-time.After(300 * time.Millisecond):
+		// several ping intervals have passed with no timeout — as expected
+	}
+
+	if err := clientConn.Close(websocket.StatusNormalClosure, "done"); err != nil {
+		t.Fatalf("client close failed: %v", err)
+	}
+
+	select {
+	case <-loopReturned:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for ReadLoop to return after client close")
+	}
+}
+
+func TestConnection_ReadLoop_ClosesConnectionWhenPeerStopsReading(t *testing.T) {
+	onCloseCalled := make(chan struct{})
+	pingConfig := ws.PingConfig{Interval: 50 * time.Millisecond, Timeout: 100 * time.Millisecond}
+	handler := ws.NewHandler(testLogger(), pingConfig, func(c *ws.Connection) {
+		c.ReadLoop(context.Background(), func(data []byte) {}, func() {
+			close(onCloseCalled)
+		})
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	clientConn, _, err := websocket.Dial(ctx, wsURL(server.URL), nil)
+	if err != nil {
+		t.Fatalf("client dial failed: %v", err)
+	}
+	defer clientConn.CloseNow()
+
+	// Deliberately never call clientConn.Read here: coder/websocket only
+	// auto-replies to a ping from inside an in-progress Read, so a client
+	// that never reads is indistinguishable, from the server's side, from
+	// a peer that has gone silent over a partitioned network. No close
+	// frame is sent either, so the only thing that can end this loop is
+	// the ping timeout.
+	select {
+	case <-onCloseCalled:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for onClose to be called after the peer stopped reading")
 	}
 }

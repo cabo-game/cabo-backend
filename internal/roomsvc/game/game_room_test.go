@@ -143,3 +143,61 @@ func TestGameRoom_JoinRoom_ConcurrentJoinsRespectCapacity(t *testing.T) {
 		t.Errorf("len(room.Players) = %d, want %d", len(room.Players), MaxPlayersPerRoom)
 	}
 }
+
+func TestGameRoom_RemovePlayer_RemovesMatchingPlayer(t *testing.T) {
+	first := &Player{ID: "player-1"}
+	room, err := NewGameRoom(first, MaxPlayersPerRoom, testLogger())
+	if err != nil {
+		t.Fatalf("NewGameRoom returned error: %v", err)
+	}
+	second := &Player{ID: "player-2"}
+	if err := room.JoinRoom(second); err != nil {
+		t.Fatalf("JoinRoom returned error: %v", err)
+	}
+
+	isEmpty := room.RemovePlayer(first.ID)
+
+	if isEmpty {
+		t.Error("RemovePlayer reported room empty, want not empty (player-2 still seated)")
+	}
+	if len(room.Players) != 1 {
+		t.Fatalf("len(room.Players) = %d, want 1", len(room.Players))
+	}
+	if room.Players[0] != second {
+		t.Errorf("room.Players[0] = %v, want %v", room.Players[0], second)
+	}
+}
+
+func TestGameRoom_RemovePlayer_ReportsEmptyWhenLastPlayerLeaves(t *testing.T) {
+	first := &Player{ID: "player-1"}
+	room, err := NewGameRoom(first, MaxPlayersPerRoom, testLogger())
+	if err != nil {
+		t.Fatalf("NewGameRoom returned error: %v", err)
+	}
+
+	isEmpty := room.RemovePlayer(first.ID)
+
+	if !isEmpty {
+		t.Error("RemovePlayer reported room not empty, want empty")
+	}
+	if len(room.Players) != 0 {
+		t.Errorf("len(room.Players) = %d, want 0", len(room.Players))
+	}
+}
+
+func TestGameRoom_RemovePlayer_UnknownPlayerIDLeavesRoomUnchanged(t *testing.T) {
+	first := &Player{ID: "player-1"}
+	room, err := NewGameRoom(first, MaxPlayersPerRoom, testLogger())
+	if err != nil {
+		t.Fatalf("NewGameRoom returned error: %v", err)
+	}
+
+	isEmpty := room.RemovePlayer("does-not-exist")
+
+	if isEmpty {
+		t.Error("RemovePlayer reported room empty, want not empty (player-1 still seated)")
+	}
+	if len(room.Players) != 1 {
+		t.Fatalf("len(room.Players) = %d, want 1 (unchanged)", len(room.Players))
+	}
+}

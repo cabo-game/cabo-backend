@@ -20,6 +20,12 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// testPingConfig returns a PingConfig with an interval long enough that the
+// keepalive never fires during a test's short lifetime.
+func testPingConfig() ws.PingConfig {
+	return ws.PingConfig{Interval: time.Hour, Timeout: time.Minute}
+}
+
 // noopNotifier is a test double for authclient.Client that does nothing —
 // handoff's tests care about room create/join behavior, not about what
 // gets reported to authsvc.
@@ -47,7 +53,7 @@ func dialAndHandle(t *testing.T, roomManager *game.RoomManager) (clientConn *web
 	t.Helper()
 
 	results := make(chan handleResult, 1)
-	h := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	h := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		player, room, err := handoff.Handle(context.Background(), c, roomManager, testLogger())
 		results <- handleResult{player: player, room: room, err: err}
 	})

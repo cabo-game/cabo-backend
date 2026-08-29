@@ -10,7 +10,8 @@ import (
 // Handler upgrades incoming HTTP requests to WebSocket connections and hands
 // each accepted Connection to OnConnect.
 type Handler struct {
-	log *slog.Logger
+	log        *slog.Logger
+	pingConfig PingConfig
 
 	// OnConnect is called once per accepted connection, in its own
 	// goroutine. This is the seam where auth validation and room
@@ -21,11 +22,14 @@ type Handler struct {
 }
 
 // NewHandler builds a Handler. OnConnect must be set by the caller before
-// the handler serves any requests.
-func NewHandler(log *slog.Logger, onConnect func(*Connection)) *Handler {
+// the handler serves any requests. pingConfig is passed through to every
+// accepted Connection to configure its ping/pong keepalive (see
+// Connection.ReadLoop).
+func NewHandler(log *slog.Logger, pingConfig PingConfig, onConnect func(*Connection)) *Handler {
 	return &Handler{
-		log:       log,
-		OnConnect: onConnect,
+		log:        log,
+		pingConfig: pingConfig,
+		OnConnect:  onConnect,
 	}
 }
 
@@ -39,6 +43,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	connection := NewConnection(conn, r.RemoteAddr, h.log)
+	connection := NewConnection(conn, r.RemoteAddr, h.log, h.pingConfig)
 	go h.OnConnect(connection)
 }

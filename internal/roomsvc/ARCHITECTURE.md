@@ -21,20 +21,27 @@ close).
 classDiagram
     class Handler {
         -log *slog.Logger
+        -pingConfig PingConfig
         +OnConnect func(*Connection)
-        +NewHandler(log, onConnect) *Handler
+        +NewHandler(log, pingConfig, onConnect) *Handler
         +ServeHTTP(w, r)
+    }
+
+    class PingConfig {
+        +Interval time.Duration
+        +Timeout time.Duration
     }
 
     class Connection {
         -conn *websocket.Conn
         -remoteAddr string
         -log *slog.Logger
+        -pingConfig PingConfig
         -writeMu sync.Mutex
-        +NewConnection(conn, remoteAddr, log) *Connection
+        +NewConnection(conn, remoteAddr, log, pingConfig) *Connection
         +RemoteAddr() string
         +ReadOne(ctx) ([]byte, error)
-        +ReadLoop(ctx, onMessage)
+        +ReadLoop(ctx, onMessage, onClose)
         +Write(ctx, data) error
         +Close(code, reason)
         +CloseNow()
@@ -62,6 +69,31 @@ nothing to wait for. This distinction mattered in practice: `handoff`
 tests hung for exactly the wait `Close` documents, because the test client
 never sent a close frame back.
 
+`ReadLoop`'s `onClose` runs exactly once after the loop ends for any reason
+(client close, read error, `ctx` cancellation, or a ping timeout — see
+below) — the seam for a caller to release whatever it associated with the
+connection while the loop was running (e.g. seating a player in a room),
+without `ws` needing any knowledge of what that association is.
+`cmd/roomsvc/main.go`'s `onConnect` uses it to call `RoomManager.RemovePlayer`,
+so a dropped connection no longer leaves a stuck seat in its room.
+
+`ReadLoop` also runs a ping/pong keepalive for the life of the loop
+(`pingLoop`, unexported), configured by the `PingConfig` passed to
+`NewConnection`/`NewHandler`. This detects a peer that has gone silent
+without a normal WebSocket close — e.g. a network partition — which a
+plain read error can't catch: a dead-but-silent TCP connection blocks
+`Read` forever instead of erroring, so nothing before this would ever
+notice. `pingLoop` sends a ping every `PingConfig.Interval` and calls
+`CloseNow` if a pong isn't observed within `PingConfig.Timeout`; that
+unblocks the stuck `Read` the same way any other close does, so `ReadLoop`
+returns through its normal path and `onClose` still fires.
+`coder/websocket`'s `Ping` only completes once the peer's pong is observed
+by an in-progress `Read` on the same connection, so `pingLoop` must run
+concurrently with the read loop — `ReadLoop` starts it as a sibling
+goroutine scoped to the same `ctx`, never before or after. `cmd/roomsvc/main.go`
+reads `PingConfig.Interval`/`Timeout` from `ROOMSVC_PING_INTERVAL`/
+`ROOMSVC_PING_TIMEOUT` (defaults 30s/10s), via `newPingConfig`.
+
 ## internal/roomsvc/game — game domain
 
 `GameRoom` is one game's authoritative state. It cannot be constructed
@@ -81,6 +113,7 @@ classDiagram
         -mu sync.Mutex
         +NewGameRoom(firstPlayer, maxPlayers, log) (*GameRoom, error)
         +JoinRoom(player) error
+        +RemovePlayer(playerID) bool
     }
 
     class Player {
@@ -116,13 +149,25 @@ classDiagram
         -mu sync.RWMutex
         -rooms map~string, GameRoom~
         -log *slog.Logger
-        +NewRoomManager(log) *RoomManager
+        -notifier authclient.Client
+        +NewRoomManager(log, notifier) *RoomManager
         +CreateRoom(firstPlayer, maxPlayers) (*GameRoom, error)
         +GetRoom(roomID) (*GameRoom, error)
+        +RemovePlayer(room, playerID)
+        +RemoveRoom(roomID)
     }
 
     RoomManager "1" --> "0..*" GameRoom : rooms
 ```
+
+`RemovePlayer` removes a player from its room via `GameRoom.RemovePlayer`
+and, if that empties the room, calls `RemoveRoom` to drop it from this
+instance's registry too — the current, narrow rule for when a room goes
+away. `RemoveRoom` is its own method (not folded into `RemovePlayer`)
+because other, not-yet-designed triggers (e.g. a game ending with players
+still connected) will need to remove a room without a player disconnect.
+`cmd/roomsvc/main.go`'s `onConnect` calls `RemovePlayer` from `ReadLoop`'s
+`onClose` hook.
 
 ## internal/roomsvc/registry — etcd liveness registration
 
