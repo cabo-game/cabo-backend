@@ -64,3 +64,34 @@ func (m *RoomManager) GetRoom(roomID string) (*GameRoom, error) {
 
 	return room, nil
 }
+
+// RemovePlayer removes playerID from room and, if that leaves the room
+// empty, also removes the room itself from this RoomManager so GetRoom can
+// no longer find it. This is the current, narrow rule for when a room goes
+// away (a disconnect emptying it); RemoveRoom exists as its own method
+// because other, not-yet-designed triggers (e.g. a game ending with
+// players still connected) will need to remove a room without going
+// through a player disconnect.
+func (m *RoomManager) RemovePlayer(room *GameRoom, playerID string) {
+	if room.RemovePlayer(playerID) {
+		m.RemoveRoom(room.ID)
+	}
+}
+
+// RemoveRoom removes the room with the given ID from this RoomManager, so
+// GetRoom can no longer find it. Safe to call for an ID that is not (or no
+// longer) registered — it logs and no-ops rather than erroring.
+func (m *RoomManager) RemoveRoom(roomID string) {
+	m.mu.Lock()
+	_, ok := m.rooms[roomID]
+	delete(m.rooms, roomID)
+	roomCount := len(m.rooms)
+	m.mu.Unlock()
+
+	if !ok {
+		m.log.Warn("room removal requested but room not registered", "room_id", roomID)
+		return
+	}
+
+	m.log.Info("room removed", "room_id", roomID, "room_count", roomCount)
+}

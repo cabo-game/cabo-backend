@@ -8,15 +8,30 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 )
+
+// PingConfig controls the ping/pong keepalive ReadLoop runs for the life of
+// the connection, to detect a peer that has gone silent without a normal
+// WebSocket close (e.g. a network partition) — a plain read error can't
+// detect this, since a dead-but-silent TCP connection simply blocks Read
+// forever instead of returning an error.
+type PingConfig struct {
+	// Interval is how often a ping is sent while the connection is open.
+	Interval time.Duration
+	// Timeout is how long to wait for a pong before treating the peer as
+	// unresponsive and force-closing the connection.
+	Timeout time.Duration
+}
 
 // Connection wraps one accepted WebSocket connection for a single client.
 type Connection struct {
 	conn       *websocket.Conn
 	remoteAddr string
 	log        *slog.Logger
+	pingConfig PingConfig
 
 	// writeMu serializes writes: the underlying connection does not allow
 	// concurrent writes from multiple goroutines.
@@ -24,11 +39,12 @@ type Connection struct {
 }
 
 // NewConnection wraps an already-accepted WebSocket connection.
-func NewConnection(conn *websocket.Conn, remoteAddr string, log *slog.Logger) *Connection {
+func NewConnection(conn *websocket.Conn, remoteAddr string, log *slog.Logger, pingConfig PingConfig) *Connection {
 	return &Connection{
 		conn:       conn,
 		remoteAddr: remoteAddr,
 		log:        log.With("remote_addr", remoteAddr),
+		pingConfig: pingConfig,
 	}
 }
 
@@ -59,6 +75,12 @@ func (c *Connection) ReadOne(ctx context.Context) ([]byte, error) {
 // the seam where message-protocol parsing and room/game routing will plug
 // in once that contract is decided.
 //
+// onClose runs exactly once, after the loop has ended for any reason
+// (client close, read error, ctx cancellation, or a ping timeout — see
+// below) — the seam for a caller to release whatever it associated with
+// this connection while the loop was running (e.g. seating a player in a
+// room), without ws needing any knowledge of what that association is.
+//
 // ReadLoop closes the connection before returning, so callers do not need
 // to call Close separately in the normal case.
 //
@@ -67,14 +89,26 @@ func (c *Connection) ReadOne(ctx context.Context) ([]byte, error) {
 // itself and force-closes the connection when it's done, since closing the
 // underlying connection is what actually interrupts a blocked Read
 // immediately.
-func (c *Connection) ReadLoop(ctx context.Context, onMessage func(data []byte)) {
+//
+// ReadLoop also runs a ping/pong keepalive for the life of the loop (see
+// pingLoop), to detect a peer that has gone silent without a normal
+// WebSocket close — e.g. a network partition, where the underlying TCP
+// connection blocks Read forever instead of erroring. A ping timeout closes
+// the connection the same way a read error does, so it unblocks Read and
+// this loop returns through the same path.
+func (c *Connection) ReadLoop(ctx context.Context, onMessage func(data []byte), onClose func()) {
 	c.log.Info("connection opened")
 	defer c.log.Info("connection closed")
+	defer onClose()
 
 	stopWatchingCtx := context.AfterFunc(ctx, func() {
 		c.Close(websocket.StatusNormalClosure, "server shutting down")
 	})
 	defer stopWatchingCtx()
+
+	pingCtx, stopPinging := context.WithCancel(ctx)
+	defer stopPinging()
+	go c.pingLoop(pingCtx)
 
 	for {
 		data, err := c.readFrame(ctx)
@@ -82,6 +116,41 @@ func (c *Connection) ReadLoop(ctx context.Context, onMessage func(data []byte)) 
 			return
 		}
 		onMessage(data)
+	}
+}
+
+// pingLoop sends a ping every c.pingConfig.Interval for as long as ctx is
+// not done, and force-closes the connection if any single ping does not
+// get a pong back within c.pingConfig.Timeout. This is what detects a
+// silently dead connection (e.g. a network partition) that a plain Read
+// would otherwise block on forever.
+//
+// coder/websocket's Ping only completes once the peer's pong is observed
+// by an in-progress Read on this connection, so pingLoop must run
+// concurrently with ReadLoop's read loop, never on its own.
+func (c *Connection) pingLoop(ctx context.Context) {
+	ticker := time.NewTicker(c.pingConfig.Interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, c.pingConfig.Timeout)
+			err := c.conn.Ping(pingCtx)
+			cancel()
+			if err != nil {
+				if ctx.Err() != nil {
+					// ctx ended (ReadLoop returned) while this ping was in
+					// flight — not an unresponsive peer, nothing to do.
+					return
+				}
+				c.log.Warn("ping timed out, closing unresponsive connection", "error", err)
+				c.CloseNow()
+				return
+			}
+		}
 	}
 }
 
@@ -102,6 +171,7 @@ func (c *Connection) readFrame(ctx context.Context) ([]byte, error) {
 			c.log.Info("connection closed: context done", "reason", ctx.Err())
 		default:
 			c.log.Warn("read failed, closing connection", "error", err)
+			// it is done because in other 2 cases connection was already closed by conn / cx
 			c.Close(websocket.StatusInternalError, "read failed")
 		}
 		return nil, err

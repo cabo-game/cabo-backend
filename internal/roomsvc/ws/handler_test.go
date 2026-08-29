@@ -17,9 +17,16 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// testPingConfig returns a PingConfig with an interval long enough that the
+// keepalive never fires during a test's short lifetime, so ping/pong
+// behavior doesn't need to be considered by tests that aren't targeting it.
+func testPingConfig() ws.PingConfig {
+	return ws.PingConfig{Interval: time.Hour, Timeout: time.Minute}
+}
+
 func TestHandler_AcceptsWebSocketUpgrade(t *testing.T) {
 	connected := make(chan *ws.Connection, 1)
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		connected <- c
 	})
 	server := httptest.NewServer(handler)
@@ -45,7 +52,7 @@ func TestHandler_AcceptsWebSocketUpgrade(t *testing.T) {
 }
 
 func TestHandler_RejectsPlainHTTPRequest(t *testing.T) {
-	handler := ws.NewHandler(testLogger(), func(c *ws.Connection) {
+	handler := ws.NewHandler(testLogger(), testPingConfig(), func(c *ws.Connection) {
 		t.Error("OnConnect should not fire for a non-upgrade request")
 	})
 	server := httptest.NewServer(handler)

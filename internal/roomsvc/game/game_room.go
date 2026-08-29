@@ -67,3 +67,27 @@ func (r *GameRoom) JoinRoom(player *Player) error {
 
 	return nil
 }
+
+// RemovePlayer removes the player with the given ID from the room, e.g.
+// when their connection closes. It reports whether the room is now empty,
+// so a caller (RoomManager) can decide whether to remove the room itself.
+// Safe for concurrent use, under the same lock as JoinRoom. If no player
+// with playerID is seated (e.g. RemovePlayer is called twice for the same
+// disconnect), it logs a warning and leaves the room unchanged rather than
+// erroring — a connection that is already gone is not a failure case for
+// the caller to handle.
+func (r *GameRoom) RemovePlayer(playerID string) (isEmpty bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for i, p := range r.Players {
+		if p.ID == playerID {
+			r.Players = append(r.Players[:i], r.Players[i+1:]...)
+			r.log.Info("player removed from room", "room_id", r.ID, "player_id", playerID, "player_count", len(r.Players))
+			return len(r.Players) == 0
+		}
+	}
+
+	r.log.Warn("player removal requested but player not found in room", "room_id", r.ID, "player_id", playerID)
+	return len(r.Players) == 0
+}

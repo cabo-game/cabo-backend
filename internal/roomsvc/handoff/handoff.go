@@ -47,7 +47,10 @@ type response struct {
 // On failure, the connection has already been closed — the caller does
 // not need to close it again.
 func Handle(ctx context.Context, conn *ws.Connection, roomManager *game.RoomManager, log *slog.Logger) (*game.Player, *game.GameRoom, error) {
+	// the bllow call is the network & a blocking call
+	// TODO: here I was thinking that if 1st message is wrong then client should be given chance to send some more messages or it should be deleted
 	data, err := conn.ReadOne(ctx)
+	log.Info("First data received is", "data", string(data))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -58,8 +61,11 @@ func Handle(ctx context.Context, conn *ws.Connection, roomManager *game.RoomMana
 	}
 
 	player := game.NewPlayer(conn)
-
+	log.Info("Step 1 : Player created next step going to assign room to it")
 	var room *game.GameRoom
+
+	// See here one pattern that in switch statement the error which came it is not checked
+	// for each case statement individually instead it is checked once i.e if err != nil {}
 	switch req.Action {
 	case actionCreateRoom:
 		room, err = roomManager.CreateRoom(player, game.MaxPlayersPerRoom)
