@@ -134,7 +134,7 @@ func TestRoomManager_RemovePlayer_RemovesPlayerButKeepsNonEmptyRoom(t *testing.T
 		t.Fatalf("CreateRoom returned error: %v", err)
 	}
 	second := &Player{ID: "player-2"}
-	if err := room.JoinRoom(second); err != nil {
+	if _, err := room.JoinRoom(second); err != nil {
 		t.Fatalf("JoinRoom returned error: %v", err)
 	}
 

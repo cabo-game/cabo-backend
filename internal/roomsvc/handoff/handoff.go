@@ -66,13 +66,17 @@ func Handle(ctx context.Context, conn *ws.Connection, roomManager *game.RoomMana
 
 	// See here one pattern that in switch statement the error which came it is not checked
 	// for each case statement individually instead it is checked once i.e if err != nil {}
+	isFull := false
 	switch req.Action {
 	case actionCreateRoom:
 		room, err = roomManager.CreateRoom(player, game.MaxPlayersPerRoom)
+		if err == nil {
+			isFull = room.IsFull() // covers maxPlayers=1 rooms, already full at creation
+		}
 	case actionJoinRoom:
 		room, err = roomManager.GetRoom(req.RoomID)
 		if err == nil {
-			err = room.JoinRoom(player)
+			isFull, err = room.JoinRoom(player)
 		}
 	default:
 		err = fmt.Errorf("handoff: unknown action %q", req.Action)
@@ -80,6 +84,12 @@ func Handle(ctx context.Context, conn *ws.Connection, roomManager *game.RoomMana
 
 	if err != nil {
 		return nil, nil, reject(ctx, conn, log, err.Error())
+	}
+
+	if isFull {
+		if err := room.StartGame(game.CardsPerPlayerAtStart); err != nil {
+			log.Error("handoff: failed to start game", "room_id", room.ID, "error", err)
+		}
 	}
 
 	body, err := json.Marshal(response{Status: "ok", RoomID: room.ID})

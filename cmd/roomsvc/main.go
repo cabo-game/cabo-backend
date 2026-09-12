@@ -66,11 +66,12 @@ func main() {
 
 	handler := ws.NewHandler(log, pingConfig, onConnect(log, roomManager))
 
+	// mux is multiplexer the below is go's bultin HTTP router its job is to look at path of incoming request & send it to right handler
 	mux := http.NewServeMux()
 	mux.Handle("/ws", handler)
 
 	server := &http.Server{
-		Addr:    listenAddr,
+		Addr:    listenAddr, // this is only port address
 		Handler: mux,
 	}
 

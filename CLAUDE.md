@@ -200,26 +200,36 @@ Implemented so far:
   why the connection is ending. Use `CloseNow` whenever the peer has
   already gotten its answer through some other channel.
 - `internal/roomsvc/game/` — game domain, package `game` (imports `ws` for
-  `Player.Conn`; `ws` has no dependency back on `game`). `GameRoom` (id, `*GameState`,
+  `Player.Conn` and `cards` for `Player.Hand`/`GameState.RemainingCards`;
+  neither `ws` nor `cards` depends back on `game`). `GameRoom` (id, `*GameState`,
   `MaxPlayers`, seated `Player`s) cannot be constructed without at least one
   player, and `NewGameRoom` rejects a `maxPlayers` outside `1..MaxPlayersPerRoom`
   with an error. `JoinRoom` seats a new player under a mutex, so the
-  capacity check and the append can't race across goroutines. `Player`
+  capacity check and the append can't race across goroutines; it also
+  returns `isFull` (computed under the same lock) so a caller knows when
+  the room has just filled. `IsFull()` covers the one case `JoinRoom`
+  can't: a room created with `maxPlayers=1` is already full at creation,
+  with no `JoinRoom` call ever happening for it. `Player`
   wraps a `*ws.Connection` with player identity; `NewPlayer(conn)`
   generates a random, opaque ID (`generatePlayerID`, 128 bits via
   `crypto/rand`) — not authentication, just enough to distinguish players
   within this instance's rooms (real identity is a separate, undecided
   design effort). Existing tests still build `Player{ID: "..."}` literals
   directly where a fixed ID is more convenient for assertions; `NewPlayer`
-  is for real connections, via `handoff` (see below). `GameState` is an
-  explicit placeholder — see Shared Project Context above; its real shape
-  is deferred to the shared game-logic spec, not invented here.
+  is for real connections, via `handoff` (see below). `Player` now also
+  carries `Hand []cards.Card`, dealt by `GameRoom.StartGame` (next
+  paragraph). `GameState` is still mostly a placeholder — see Shared
+  Project Context above; card values, special powers, and turn/round state
+  are deferred to the shared game-logic spec, not invented here — but it
+  now holds `RemainingCards []cards.Card`, the draw pile left after
+  dealing.
   `room_code.go` generates the room's id: an 8-character, `crypto/rand`-backed
   code from an alphabet with ambiguous characters removed. Collision
   checking against other live rooms is a known, intentional gap — no room
   registry exists yet to check against. `rules.go` holds game constants
-  mirrored from `../cabo-bmad/docs/cabo.md` (currently `MaxPlayersPerRoom
-  = 4`) — update that doc first, this file second, if a rule ever changes.
+  mirrored from `../cabo-bmad/docs/cabo.md` (`MaxPlayersPerRoom = 4`,
+  `CardsPerPlayerAtStart = 4`) — update that doc first, this file second,
+  if a rule ever changes.
   `RoomManager` tracks every `GameRoom` live on this instance, keyed by
   room ID (`CreateRoom`, `GetRoom`), guarded by an `RWMutex`. `GameRoom`
   now has `RemovePlayer(playerID)`, which removes a seated player and
@@ -238,7 +248,22 @@ Implemented so far:
   notifies nobody). Constructed in `cmd/roomsvc/main.go` and called from
   `onConnect`, via `handoff.Handle` (see below) for the create/join
   handshake and via `ws.Connection.ReadLoop`'s new `onClose` callback
-  parameter for cleanup when the connection ends.
+  parameter for cleanup when the connection ends. `GameRoom.StartGame(cardsPerPlayer)`
+  deals opening hands to every seated player from a freshly shuffled
+  `cards.NewDeck()`, storing the leftover as `State.RemainingCards`; it can
+  only run once per room (no re-dealing mid-game), and `handoff.Handle`
+  calls it once a room fills (see the `handoff` bullet below and
+  `cards`, next).
+- `internal/roomsvc/cards/` — standard 52-card deck mechanics: `Card`
+  (`Rank`+`Suit`), `NewDeck()` (52 cards, 4 suits x 13 ranks, no jokers —
+  see `cabo-bmad/docs/cabo.md`, "Deck size"), `Shuffle` (Fisher-Yates,
+  `crypto/rand` for the same predictability reasons as room codes and
+  player IDs), and `Deal(deck, numHands, cardsPerHand)` (contiguous
+  blocks — hand 0 gets the first block, hand 1 the next, not
+  round-robin). No dependency on `game`; kept separate for the same reason
+  `ws` is separate from `game` — self-contained rules, no room/player
+  lifecycle knowledge, fully testable in isolation. Card values and
+  special powers are still undecided and deliberately not modeled here.
 - `cmd/authsvc/main.go` — implemented, scoped to room-allocation only: no
   login/auth/user-identity work (that's a separate, undecided design
   effort — see AD-6's "login, logout, authentication" wording, not
@@ -303,7 +328,14 @@ Implemented so far:
   log) (*Player, *GameRoom, error)` reads exactly one message via
   `Connection.ReadOne`, dispatches to `RoomManager.CreateRoom` or
   `RoomManager.GetRoom`+`GameRoom.JoinRoom`, and writes back the outcome.
-  On failure it closes the connection with `CloseNow` (not `Close` — see
+  After a successful create or join, it checks whether the room is now
+  full (`GameRoom.IsFull()` after a create, the `isFull` `JoinRoom`
+  returned after a join) and calls `GameRoom.StartGame(game.CardsPerPlayerAtStart)`
+  if so — this is where "minimum players to start" (see
+  `cabo-bmad/docs/cabo.md`) currently resolves to "start once the room is
+  full"; a `StartGame` failure is only logged, not surfaced to the client
+  (see Intentional Gaps below). On failure it closes the connection with
+  `CloseNow` (not `Close` — see
   the `ws` note above for why: the client already has its answer in the
   JSON body, so there's nothing to wait for). Depends on both `ws` and
   `game`; neither depends back on it. Tested against a real WebSocket
@@ -349,6 +381,28 @@ Nothing here is authoritative over the shared spine
 (`../cabo-bmad/_bmad-output/planning-artifacts/architecture/`) — if this
 section and the spine ever disagree, the spine wins and this section is
 stale and should be corrected.
+
+## Intentional Gaps
+
+- **`StartGame` failures are logged, not surfaced to the client.** If
+  `handoff.Handle` calls `GameRoom.StartGame` (once a room fills) and it
+  returns an error, the error is logged and the connection stays open —
+  the client already received its `{"status":"ok",...}` create/join
+  response before `StartGame` even runs. Why: there is no protocol yet for
+  telling an already-accepted client "something went wrong after you
+  joined" — that needs its own message contract, which is out of scope
+  for the create/join handshake. How to apply: don't assume a client ever
+  learns its game started or why it didn't; a follow-up message contract
+  is needed before this gap can close.
+- **"Minimum players to start" is hard-wired to equal `MaxPlayersPerRoom`.**
+  `GameRoom.StartGame` is only ever triggered when a room becomes full
+  (`GameRoom.IsFull()` / `JoinRoom`'s `isFull` return value). Why:
+  `cabo-bmad/docs/cabo.md` records this as a "for now" decision — starting
+  a game with fewer than the room's max players is a real feature someone
+  may want later, but nothing currently exercises that path. How to apply:
+  if an early-start feature is ever added, it needs its own trigger
+  (separate from `IsFull`) and its own decision recorded in `cabo.md`
+  first.
 
 ## Running Locally
 

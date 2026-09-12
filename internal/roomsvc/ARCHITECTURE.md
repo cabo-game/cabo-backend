@@ -4,12 +4,14 @@ One consolidated view of every struct in roomsvc so far and how they link
 together. Individual per-class docs (purpose + method descriptions) live in
 `cabo-bmad/_bmad-output/implementation-artifacts/architecture/`.
 
-roomsvc is split into five packages: `ws` (WebSocket transport), `game`
-(game domain), `registry` (etcd liveness), `authclient` (authsvc
-notification), and `handoff` (the WebSocket create/join handshake, layered
-above both `ws` and `game`). Dependencies only point one way — `game`
-imports `ws` for `Player.Conn`; `handoff` imports both `ws` and `game`;
-none of `ws`, `game`, `registry`, or `authclient` import `handoff`.
+roomsvc is split into six packages: `ws` (WebSocket transport), `game`
+(game domain), `cards` (standard 52-card deck mechanics), `registry` (etcd
+liveness), `authclient` (authsvc notification), and `handoff` (the
+WebSocket create/join handshake, layered above both `ws` and `game`).
+Dependencies only point one way — `game` imports `ws` for `Player.Conn`
+and `cards` for `Player.Hand`/`GameState.RemainingCards`; `handoff`
+imports both `ws` and `game`; none of `ws`, `game`, `cards`, `registry`,
+or `authclient` import `handoff`; `cards` imports nothing from `game`.
 
 ## internal/roomsvc/ws — WebSocket transport
 
@@ -99,8 +101,9 @@ reads `PingConfig.Interval`/`Timeout` from `ROOMSVC_PING_INTERVAL`/
 `GameRoom` is one game's authoritative state. It cannot be constructed
 without at least one `Player` already seated. `Player` wraps a `Connection`
 with player identity, keeping transport and identity separate. `GameState`
-is a placeholder pending the game-logic spec (deck rules, values, powers —
-deferred in the architecture spine).
+holds shared round state — currently just the draw pile
+(`RemainingCards`); card values, special powers, and turn/round state are
+still deferred to the game-logic spec (architecture spine).
 
 ```mermaid
 classDiagram
@@ -111,24 +114,29 @@ classDiagram
         +Players []*Player
         -log *slog.Logger
         -mu sync.Mutex
+        -started bool
         +NewGameRoom(firstPlayer, maxPlayers, log) (*GameRoom, error)
-        +JoinRoom(player) error
+        +JoinRoom(player) (isFull bool, err error)
+        +IsFull() bool
+        +StartGame(cardsPerPlayer) error
         +RemovePlayer(playerID) bool
     }
 
     class Player {
         +ID string
         +Conn *ws.Connection
+        +Hand []cards.Card
         +NewPlayer(conn) *Player
     }
 
     class GameState {
-        <<placeholder>>
+        +RemainingCards []cards.Card
     }
 
     GameRoom "1" --> "1" GameState : holds
     GameRoom "1" --> "1..*" Player : Players
     Player --> Connection : Conn
+    GameRoom ..> cards : StartGame calls NewDeck / Shuffle / Deal
 ```
 
 `NewPlayer` generates a random, opaque ID for the player (`generatePlayerID`,
@@ -138,6 +146,20 @@ a separate, undecided design effort. Existing tests still construct
 `Player{ID: "..."}` literals directly where a fixed, predictable ID is
 more convenient for assertions; `NewPlayer` is for real connections, via
 `handoff` (below).
+
+`JoinRoom`'s `isFull` return value is computed under the same lock as the
+seat assignment, so it can't go stale between the join and the caller
+checking it — the caller (`handoff`, below) uses it to decide whether to
+call `StartGame`. `IsFull` exists separately for the one case `JoinRoom`
+can't cover: a room created with `maxPlayers=1` is already full the
+instant `NewGameRoom` seats its first player, with no `JoinRoom` call ever
+happening for it.
+
+`StartGame` deals `cardsPerPlayer`-sized hands to every seated player from
+a freshly shuffled `cards.NewDeck()`, assigns each hand to its `Player`,
+and stores what's left as `State.RemainingCards`. It can only run once per
+room (guarded by `started`) — Cabo has no re-dealing mid-game, so a second
+call is an error rather than a silent no-op or a fresh reshuffle.
 
 `RoomManager` holds every `GameRoom` currently live on this instance, keyed
 by room ID — it is how a room created for player 1 gets found again when
@@ -168,6 +190,42 @@ because other, not-yet-designed triggers (e.g. a game ending with players
 still connected) will need to remove a room without a player disconnect.
 `cmd/roomsvc/main.go`'s `onConnect` calls `RemovePlayer` from `ReadLoop`'s
 `onClose` hook.
+
+## internal/roomsvc/cards — standard 52-card deck mechanics
+
+Pure card/deck logic: no knowledge of `GameRoom`, `Player`, or Cabo's game
+rules (card values, special powers — still undecided, see
+`cabo-bmad/docs/cabo.md`). Kept as its own package for the same reason as
+`ws` vs `game`: a self-contained unit with no reason to know about room or
+connection lifecycle, so it can be tested in total isolation.
+
+```mermaid
+classDiagram
+    class Card {
+        +Rank Rank
+        +Suit Suit
+    }
+
+    class cards_pkg {
+        <<internal/roomsvc/cards>>
+        +NewDeck() []Card
+        +Shuffle(deck []Card)
+        +Deal(deck, numHands, cardsPerHand) ([]hands, remaining, error)
+    }
+
+    cards_pkg ..> Card : builds/shuffles/deals
+```
+
+`NewDeck` returns a fixed, unshuffled 52-card deck (4 suits x 13 ranks, no
+jokers — see `cabo-bmad/docs/cabo.md`, "Decisions"). `Shuffle` randomizes a
+deck in place with Fisher-Yates, using `crypto/rand` rather than
+`math/rand`: a predictable shuffle would let a player predict the deck's
+remaining order, the same reasoning this codebase already applies to room
+codes and player IDs. `Deal` distributes `cardsPerHand` cards to each of
+`numHands` hands in contiguous blocks (hand 0 gets the first block, hand 1
+the next, and so on — not round-robin), and returns whatever's left of the
+deck as the remaining draw pile; it errors, dealing nothing, if the deck
+doesn't have enough cards.
 
 ## internal/roomsvc/registry — etcd liveness registration
 
@@ -335,6 +393,16 @@ On success, the connection stays open and continues into the normal
 `CloseNow` — see the `ws` section above for why not `Close`); there is
 nothing further to send or read.
 
+After a successful create or join, `Handle` checks whether the room is now
+full — `GameRoom.IsFull()` after a create (covers a `maxPlayers=1` room,
+already full with just its first player), or the `isFull` `JoinRoom`
+returned after a join — and calls `GameRoom.StartGame(game.CardsPerPlayerAtStart)`
+if so. This is the "minimum players to start" decision from
+`cabo-bmad/docs/cabo.md`: for now, a game starts exactly when its room
+fills, not before. A `StartGame` failure is logged but does not fail the
+handoff response the player already received — dealing cards is a
+follow-on step, not part of the create/join contract itself.
+
 ```mermaid
 classDiagram
     class request {
@@ -358,6 +426,7 @@ classDiagram
     handoff_pkg ..> response : marshals success/error replies from
     handoff_pkg ..> RoomManager : CreateRoom / GetRoom
     handoff_pkg ..> Player : NewPlayer(conn)
+    handoff_pkg ..> GameRoom : IsFull() / StartGame() once full
 ```
 
 `Handle` reads exactly one message via `Connection.ReadOne`, decides
@@ -406,6 +475,7 @@ classDiagram
     GameRoom --> Player : Players
     GameRoom --> GameState : State
     Player --> Connection : Conn
+    handoff_pkg --> GameRoom : IsFull() / StartGame() once full
 ```
 
 A client connects over WebSocket (`Handler` → `Connection`). `onConnect`
@@ -416,13 +486,15 @@ first occupant of a new `GameRoom`) or `RoomManager.GetRoom` +
 spine AD-6/AD-7's deferred "room assignment" question is now answered by
 `handoff`'s message contract (see above). `CreateRoom` also calls
 `Client.NotifyRoomCreated` so authsvc learns the new room's address; this
-never blocks or fails room creation itself. On success, `onConnect`
-continues into `conn.ReadLoop` for whatever comes next (actual gameplay
-message routing — not built yet, a separate task). Independently of all
-of this, `Registrar` keeps the process's own liveness lease renewed in
-etcd for as long as roomsvc runs. `Registrar`, `RoomManager`, the
-`authclient.httpClient` it wraps, and now the handoff handshake are all
-constructed and running end-to-end in `main.go`.
+never blocks or fails room creation itself. Once the room fills, `handoff`
+also calls `GameRoom.StartGame`, which deals opening hands from the
+`cards` package. On success, `onConnect` continues into `conn.ReadLoop`
+for whatever comes next (actual gameplay message routing — not built yet,
+a separate task). Independently of all of this, `Registrar` keeps the
+process's own liveness lease renewed in etcd for as long as roomsvc runs.
+`Registrar`, `RoomManager`, the `authclient.httpClient` it wraps, and now
+the handoff handshake are all constructed and running end-to-end in
+`main.go`.
 
 ## Non-class files
 
@@ -443,8 +515,10 @@ classDiagram
     class rules {
         <<internal/roomsvc/game/rules.go>>
         +MaxPlayersPerRoom int
+        +CardsPerPlayerAtStart int
     }
 
     GameRoom ..> room_code : NewGameRoom calls generateRoomCode
     GameRoom ..> rules : NewGameRoom / JoinRoom validate against MaxPlayersPerRoom
+    handoff_pkg ..> rules : passes CardsPerPlayerAtStart to StartGame
 ```

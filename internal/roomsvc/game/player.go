@@ -5,14 +5,17 @@ import (
 	"encoding/hex"
 	"fmt"
 
+	"github.com/cabo/cabo-backend/internal/roomsvc/cards"
 	"github.com/cabo/cabo-backend/internal/roomsvc/ws"
 )
 
-// Player is one occupant of a GameRoom: their identity plus the WebSocket
-// connection carrying their messages.
+// Player is one occupant of a GameRoom: their identity, the WebSocket
+// connection carrying their messages, and the cards they hold. Hand is
+// nil until GameRoom.StartGame deals cards.
 type Player struct {
 	ID   string
 	Conn *ws.Connection
+	Hand []cards.Card
 }
 
 // playerIDBytes is the number of random bytes used to generate a player
