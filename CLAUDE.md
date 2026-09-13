@@ -102,6 +102,20 @@ This includes changes involving:
 
 Do not create duplicate system-level artifacts in this repository.
 
+## Class Diagrams
+
+Whenever a class diagram is produced (LLDs, architecture docs, design
+discussions), every class must show which Go package it belongs to —
+either as a `<<package/path>>` stereotype/annotation on the class itself,
+or grouped under a `namespace` block per package. Package placement is a
+security- and design-relevant decision in Go, not a documentation
+afterthought: Go's only access-control boundary is the package (exported
+vs. unexported), so which package a type lives in determines what it can
+actually reach — e.g. whether a game-action handler can access a live
+`*ws.Connection` at all is decided by whether its package imports `ws`,
+not by convention or interface discipline alone. Decide and show package
+placement as part of the design itself, not after the fact.
+
 ## BMAD Development
 
 Follow the BMAD methodology for development work.
