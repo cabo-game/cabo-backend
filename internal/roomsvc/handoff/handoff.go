@@ -3,6 +3,7 @@
 // flow (spine AD-9, roomsvc's half of the client-driven handoff). See
 // internal/roomsvc/ARCHITECTURE.md for the full message contract this
 // package implements.
+// handoff follows DIP (dependency inversion principle) it sits above both ws & room_manager
 package handoff
 
 import (
