@@ -19,6 +19,7 @@ import (
 
 	"github.com/cabo/cabo-backend/internal/roomsvc/authclient"
 	"github.com/cabo/cabo-backend/internal/roomsvc/game"
+	"github.com/cabo/cabo-backend/internal/roomsvc/gameplay"
 	"github.com/cabo/cabo-backend/internal/roomsvc/handoff"
 	"github.com/cabo/cabo-backend/internal/roomsvc/registry"
 	"github.com/cabo/cabo-backend/internal/roomsvc/ws"
@@ -64,7 +65,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	handler := ws.NewHandler(log, pingConfig, onConnect(log, roomManager))
+	dispatcher := gameplay.NewDispatcher(log)
+
+	handler := ws.NewHandler(log, pingConfig, onConnect(log, roomManager, dispatcher))
 
 	// mux is multiplexer the below is go's bultin HTTP router its job is to look at path of incoming request & send it to right handler
 	mux := http.NewServeMux()
@@ -204,12 +207,13 @@ func newPingConfig() (ws.PingConfig, error) {
 
 // onConnect runs the create/join handshake (spine AD-9; see
 // internal/roomsvc/handoff and internal/roomsvc/ARCHITECTURE.md for the
-// message contract) on every new connection, then hands off to the
-// normal read loop for whatever comes next. Real auth validation is still
-// a separate, undecided design effort (see CLAUDE.md's Current State) —
-// this only decides which room a connection belongs to, not who the
-// player is.
-func onConnect(log *slog.Logger, roomManager *game.RoomManager) func(*ws.Connection) {
+// message contract) on every new connection, then hands off to
+// dispatcher for every gameplay message that follows (see
+// internal/roomsvc/gameplay and GAMEPLAY_LLD_DRAFT.md). Real auth
+// validation is still a separate, undecided design effort (see CLAUDE.md's
+// Current State) — this only decides which room a connection belongs to,
+// not who the player is.
+func onConnect(log *slog.Logger, roomManager *game.RoomManager, dispatcher *gameplay.Dispatcher) func(*ws.Connection) {
 	return func(conn *ws.Connection) {
 		ctx := context.Background()
 
@@ -222,7 +226,7 @@ func onConnect(log *slog.Logger, roomManager *game.RoomManager) func(*ws.Connect
 		log.Info("player joined room", "remote_addr", conn.RemoteAddr(), "player_id", player.ID, "room_id", room.ID)
 
 		conn.ReadLoop(ctx, func(data []byte) {
-			log.Info("message received", "player_id", player.ID, "room_id", room.ID, "bytes", len(data))
+			dispatcher.OnMessage(room, player.ID, data)
 		}, func() {
 			log.Info("connection closed, removing player from room", "player_id", player.ID, "room_id", room.ID)
 			roomManager.RemovePlayer(room, player.ID)

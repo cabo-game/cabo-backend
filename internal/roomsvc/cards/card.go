@@ -39,8 +39,10 @@ const (
 	King
 )
 
-// Card is one playing card: a rank paired with a suit.
+// Card is one playing card: a rank paired with a suit. JSON-tagged in
+// snake_case to match the rest of the gameplay wire contract (player_id,
+// room_id, etc.) — see cabo-bmad/_bmad-output/.../BACKEND-CONTRACT-FOR-FRONTEND.md.
 type Card struct {
-	Rank Rank
-	Suit Suit
+	Rank Rank `json:"rank"`
+	Suit Suit `json:"suit"`
 }

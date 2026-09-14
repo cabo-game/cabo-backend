@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/cabo/cabo-backend/internal/roomsvc/cards"
+	"github.com/cabo/cabo-backend/internal/roomsvc/ws"
 )
 
 // GameRoom is one game's authoritative state and the players connected to
@@ -117,14 +118,147 @@ func (r *GameRoom) StartGame(cardsPerPlayer int) error {
 		return fmt.Errorf("roomsvc: room %s: %w", r.ID, err)
 	}
 
+	turnOrder := make([]string, len(r.Players))
 	for i, player := range r.Players {
 		player.Hand = hands[i]
+		turnOrder[i] = player.ID
 	}
 	r.State.RemainingCards = remaining
+	r.State.TurnOrder = turnOrder
 	r.started = true
 
 	r.log.Info("game started", "room_id", r.ID, "player_count", len(r.Players), "cards_per_player", cardsPerPlayer, "remaining_cards", len(remaining))
 
+	return nil
+}
+
+// CurrentPlayerID returns the ID of the player whose turn it currently is.
+// Safe for concurrent use.
+func (r *GameRoom) CurrentPlayerID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.State.CurrentPlayerID()
+}
+
+// AdvanceTurn moves the turn to the next player in seat order, wrapping
+// after the last player. Safe for concurrent use.
+func (r *GameRoom) AdvanceTurn() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.State.AdvanceTurn()
+}
+
+// SeatedPlayerIDs returns the IDs of every player currently seated, in
+// seat order. Safe for concurrent use. Read-only — unlike Players, it
+// does not expose *Player (and therefore not *ws.Connection either),
+// which is what makes it safe to hand to gameplay action handlers via
+// ActionView.
+func (r *GameRoom) SeatedPlayerIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ids := make([]string, len(r.Players))
+	for i, p := range r.Players {
+		ids[i] = p.ID
+	}
+	return ids
+}
+
+// PlayerConn returns the *ws.Connection of the seated player with the
+// given ID, and whether one was found. Safe for concurrent use.
+//
+// This is deliberately narrower than exposing the *Player itself: package
+// gameplay's Dispatcher is the only caller (it needs a connection to
+// deliver a PlayerView to), and handing back the full *Player would also
+// expose Hand, which is not what delivery needs and is exactly the kind
+// of unrestricted access ActionView (see action_view.go) exists to avoid
+// for action handlers. PlayerConn does not implement ActionView — it is
+// for the dispatcher's delivery step, not for action logic.
+func (r *GameRoom) PlayerConn(playerID string) (*ws.Connection, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	player := r.findPlayerLocked(playerID)
+	if player == nil {
+		return nil, false
+	}
+	return player.Conn, true
+}
+
+// findPlayerLocked returns the player with the given ID, or nil if no
+// seated player matches. Callers must hold r.mu.
+func (r *GameRoom) findPlayerLocked(playerID string) *Player {
+	for _, p := range r.Players {
+		if p.ID == playerID {
+			return p
+		}
+	}
+	return nil
+}
+
+// DrawTopCard pops the top card of the draw pile and records it as
+// playerID's pending DrawnCard. It does not add the card to Hand — Cabo
+// only changes hand size once a drawn card is later resolved (swapped in
+// or discarded), not on the draw itself; that resolution is not built yet.
+//
+// Errors if playerID is not seated, already has a pending DrawnCard (must
+// resolve it before drawing again), or the draw pile is empty.
+func (r *GameRoom) DrawTopCard(playerID string) (cards.Card, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	player := r.findPlayerLocked(playerID)
+	if player == nil {
+		return cards.Card{}, fmt.Errorf("roomsvc: player %s is not seated in room %s", playerID, r.ID)
+	}
+	if player.DrawnCard != nil {
+		return cards.Card{}, fmt.Errorf("roomsvc: player %s already has an unresolved drawn card", playerID)
+	}
+	if len(r.State.RemainingCards) == 0 {
+		return cards.Card{}, fmt.Errorf("roomsvc: room %s draw pile is empty", r.ID)
+	}
+
+	drawn := r.State.RemainingCards[0]
+	r.State.RemainingCards = r.State.RemainingCards[1:]
+	player.DrawnCard = &drawn
+
+	return drawn, nil
+}
+
+// HandOf returns a copy of playerID's current hand. Errors if playerID is
+// not seated.
+func (r *GameRoom) HandOf(playerID string) ([]cards.Card, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	player := r.findPlayerLocked(playerID)
+	if player == nil {
+		return nil, fmt.Errorf("roomsvc: player %s is not seated in room %s", playerID, r.ID)
+	}
+
+	hand := make([]cards.Card, len(player.Hand))
+	copy(hand, player.Hand)
+	return hand, nil
+}
+
+// MarkInitialCardsViewed flips playerID's ViewedInitialCards flag. Errors
+// if playerID is not seated or has already viewed their initial cards —
+// the peek is one-time only.
+func (r *GameRoom) MarkInitialCardsViewed(playerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	player := r.findPlayerLocked(playerID)
+	if player == nil {
+		return fmt.Errorf("roomsvc: player %s is not seated in room %s", playerID, r.ID)
+	}
+	if player.ViewedInitialCards {
+		return fmt.Errorf("roomsvc: player %s has already viewed their initial cards", playerID)
+	}
+
+	player.ViewedInitialCards = true
 	return nil
 }
 
